@@ -67,7 +67,7 @@ Calls from the container back to the LM use HTTP + JSON.
 | **LMClient** | host | Abstract `chat(messages, model) -> str`. `MockLMClient` returns scripted/templated replies (including ```` ```repl ```` blocks) so the MVP costs no tokens. Real clients can be added later. |
 | **CodeExtractor** | host | Regex over the LM text, returns `list[str]` of code blocks. Accepts ```` ```repl ```` (case-insensitive) and, optionally, `'''REPL ... '''`. |
 | **LMHandler** | host, thread | `ThreadingHTTPServer` on `127.0.0.1:LM_PORT`. `POST /v1/complete` → calls `LMClient.chat` → returns JSON. Loopback only; never exposed to the container directly. |
-| **LMProxyHandler** | host, thread | `ThreadingHTTPServer` reachable from the container (`host.docker.internal:PROXY_PORT`). Validates a per-session token, enforces limits (max calls, max prompt size, timeout), logs, then forwards to LMHandler. The single egress point from the sandbox to the LM. |
+| **LMProxyHandler** (served by LMProxyServer) | host, thread | `ThreadingHTTPServer` reachable from the container (`host.docker.internal:PROXY_PORT`). Validates a per-session token, enforces limits (max calls, max prompt size, timeout), logs, then forwards to LMHandler. The single egress point from the sandbox to the LM. |
 | **ContainerManager** | host | Context manager. `__enter__`: `docker run -d` the image with `sleep infinity` as PID 1, stores `container_id`. `execute(code)`: `docker exec -i <id> timeout <t> python /app/runner.py`, sends the JSON request on stdin, parses the JSON result from stdout. `reset()`: deletes `state.dill`. `__exit__`: `docker rm -f <id>`, which runs even if the loop raises. |
 | **runner.py** | container | Short-lived script, one process per `docker exec`. Reads `{code, persistent}` from stdin. Builds a namespace (loads `state.dill` if persistent) and adds `llm_query()` to it. Runs `exec(code, ns)` with stdout/stderr redirected to buffers. Saves the namespace with `dill.dump` if persistent. Prints one JSON result line. |
 | **llm_query()** | container | Helper the user code calls: `requests.post(LM_PROXY_URL + "/llm_query", json=..., headers={"X-Session-Token": ...})`. In persistent mode it also writes each reply into `_lm_cache` in the namespace, so later rounds can reuse it. |
@@ -160,6 +160,49 @@ sequenceDiagram
 `docker exec`, the container calls back into the host. That is why LMHandler
 and LMProxyHandler each run a `ThreadingHTTPServer` in its own daemon thread,
 started before the container is used.
+
+### Threading model
+
+Both servers are multithreaded at two levels:
+
+1. **One background thread per server.** Each server's `serve_forever()` runs
+   in its own daemon thread, started by the Orchestrator before the container
+   is used. The Orchestrator's main thread is then free to block on
+   `docker exec`.
+2. **One thread per request.** `ThreadingHTTPServer` (stdlib `http.server`)
+   handles each incoming request in a new thread. Set `daemon_threads = True`
+   so shutdown doesn't hang. Several `llm_query()` calls can then be in flight
+   at once, for example when user code fans out with a `ThreadPoolExecutor`.
+   A slow LM call doesn't hold up the others.
+
+```python
+class LMServer:                                # same pattern for LMProxyServer
+    def __init__(self, host, port, handler_cls, **ctx):
+        self.httpd = ThreadingHTTPServer((host, port), handler_cls)
+        self.httpd.daemon_threads = True
+        self.httpd.ctx = ctx                    # handlers read self.server.ctx
+        self._thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self._thread.start(); return self
+
+    def __exit__(self, *exc):
+        self.httpd.shutdown(); self.httpd.server_close(); self._thread.join()
+```
+
+Startup order: start LMHandler, then LMProxyServer, then open the
+`ContainerManager`. Shut down in the reverse order, which nested `with`
+blocks do for you.
+
+Thread-safety rules, because handlers run at the same time:
+* **Shared mutable state needs a lock.** That includes the proxy's per-session
+  call counter and budget, and any usage/log records LMHandler keeps.
+* **The `LMClient` must be safe to call from several threads.** `MockLMClient`
+  should keep no state, or guard its scripted-reply cursor with a lock.
+* **Don't share one `requests.Session` across handler threads.** In the proxy,
+  use a plain `requests.post` (or `urllib`) for each forwarded call.
+* **Put a timeout on every hop.** container → proxy, proxy → handler, and
+  handler → LM each need one, so a hung call can't hold a thread forever.
 
 ## 6. Interfaces
 
