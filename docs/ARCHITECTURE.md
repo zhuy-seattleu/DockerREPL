@@ -332,11 +332,11 @@ sequenceDiagram
     else
         C->>M: ContainerManager(lm_handler_address, persistent, custom_tools)
         M->>P: start ThreadingHTTPServer 0.0.0.0:0
-        M->>X: docker run … tail -f /dev/null; pip install dill requests
+        M->>X: docker run … tail -f /dev/null, then pip install dill requests
     end
     loop iteration ≤ max_iterations
         C->>H: completion(messages) (direct call)
-        H-->>C: reply with ```repl blocks
+        H-->>C: reply text with repl code blocks
         loop each code block
             C->>M: execute_code(code)
             M->>M: _build_exec_script(code) → write /workspace/_exec.py
@@ -345,9 +345,9 @@ sequenceDiagram
                 X->>P: HTTP POST /llm_query[_batched]
                 P->>H: TCP [len][JSON LMRequest]
                 H-->>P: TCP [len][JSON LMResponse] (batched: thread pool)
-                P-->>X: HTTP 200 {response | responses}
+                P-->>X: HTTP 200 JSON (response or responses)
             end
-            X-->>M: stdout JSON {stdout, stderr, locals, final_answer}
+            X-->>M: stdout JSON (stdout, stderr, locals, final_answer)
             M-->>C: REPLResult
         end
     end
@@ -448,4 +448,3 @@ Left out for now:
    pointed at a local proxy.
 5. `ContainerManager`, checked with Docker.
 6. `Client` and `examples/docker_repl_example.py`, then the end-to-end test.
- 
