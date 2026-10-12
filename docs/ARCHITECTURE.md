@@ -75,41 +75,86 @@ Only the parameters listed here are in the MVP.
 ### 3.1 `comms.py`
 
 ```python
+import socket
+from dataclasses import dataclass, field
+from typing import Any
+
+DEFAULT_TIMEOUT: int = 300                     # seconds; shared by comms and BaseLM
+
 @dataclass
-class LMRequest:            # proxy → handler
-    prompt: str | list[dict] | None = None     # single
-    prompts: list[str] | None = None           # batched
+class LMRequest:                               # proxy → handler
+    prompt: str | dict[str, Any] | None = None             # single
+    prompts: list[str | dict[str, Any]] | None = None      # batched
     model: str | None = None
 
-@dataclass
-class LMResponse:           # handler → proxy
-    error: str | None = None
-    response: str | None = None                # single
-    responses: list[str | None] | None = None  # batched, same order as prompts
-    errors: list[str | None] | None = None     # batched, per-prompt error or None
+    @property
+    def is_batched(self) -> bool: ...          # prompts is a non-empty list
+    def to_dict(self) -> dict[str, Any]: ...
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "LMRequest": ...
 
-def socket_send(sock, data: dict) -> None:     # struct.pack(">I", len(b)) + b
-def socket_recv(sock) -> dict:                 # read 4 bytes, then loop until len bytes
-def socket_request(addr, data, timeout=300) -> dict   # new connection per request
-def send_lm_request(addr, req) -> LMResponse
-def send_lm_request_batched(addr, prompts, model=None) -> LMResponse
+@dataclass
+class LMResponse:                              # handler → proxy
+    error: str | None = None                   # set → this request (or prompt) failed
+    response: str | None = None                # single
+    responses: list["LMResponse"] | None = None   # batched, same order as prompts
+
+    @property
+    def success(self) -> bool: ...             # error is None
+    def to_dict(self) -> dict[str, Any]: ...
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "LMResponse": ...
+
+def socket_send(sock: socket.socket, data: dict) -> None:
+    """4-byte big-endian length of the UTF-8 JSON payload, then the payload."""
+def socket_recv(sock: socket.socket) -> dict:
+    """Read the 4-byte length, then loop until that many bytes have arrived."""
+def socket_request(address: tuple[str, int], data: dict,
+                   timeout: int = DEFAULT_TIMEOUT) -> dict:
+    """Open a new TCP connection, send one message, read one reply, close."""
+def send_lm_request(address: tuple[str, int], request: LMRequest,
+                    timeout: int = DEFAULT_TIMEOUT) -> LMResponse:
+    """Never raises: a connection or decode failure becomes LMResponse(error=...)."""
+def send_lm_request_batched(address: tuple[str, int],
+                            prompts: list[str | dict[str, Any]],
+                            model: str | None = None,
+                            timeout: int = DEFAULT_TIMEOUT) -> list[LMResponse]:
+    """One framed request for all prompts. Returns one LMResponse per prompt,
+    in order. If the whole call fails, every slot gets the same error."""
 ```
 
-`socket_recv` has to loop until it has read all `length` bytes, because
-`recv` can return fewer bytes than asked for. If the connection closes partway
-through a message, it raises `ConnectionError`.
+* **`socket_recv` reads in a loop.** `recv` can return fewer bytes than asked
+  for, so it keeps reading until it has all `length` bytes. If the connection
+  closes before the 4-byte length arrives, it returns `{}`. If it closes partway
+  through the payload, it raises `ConnectionError`.
+* **One batched request, a list back.** On the wire, a batched reply is one
+  `LMResponse` whose `responses` holds one `LMResponse` per prompt.
+  `send_lm_request_batched` unpacks that into the `list[LMResponse]` it returns.
+* **Prompt types.** `LMRequest.prompt` is `str | dict[str, Any]`. Code in the
+  container sends a `str`, or a `dict` for a structured prompt. The Client's
+  whole conversation is a `list[dict[str, Any]]` of messages. It never crosses
+  the socket, because the Client calls `LMHandler.completion()` directly (§3.2).
 
 ### 3.2 `LMHandler`
 
 ```python
 class LMHandler:
-    def __init__(self, client: BaseLM, host="127.0.0.1", port=0,
-                 batch_max_concurrent: int = 8): ...
-    address: tuple[str, int]        # real port, read after start()
-    def start(self) -> tuple[str, int]
-    def stop(self) -> None
-    def completion(self, prompt, model=None) -> str   # direct call used by Client
-    __enter__ / __exit__            # start / stop
+    def __init__(self, client: BaseLM, host: str = "127.0.0.1", port: int = 0,
+                 max_concurrent: int = 8): ...
+    client: BaseLM
+    host: str
+    max_concurrent: int
+    _slots: threading.BoundedSemaphore        # max_concurrent LM calls in flight
+    _server: ThreadingTCPServer | None
+    _thread: threading.Thread | None
+    @property
+    def address(self) -> tuple[str, int]: ... # real port, read after start()
+    def start(self) -> tuple[str, int]: ...
+    def stop(self) -> None: ...
+    def completion(self, prompt: str | dict[str, Any] | list[dict[str, Any]],
+                   model: str | None = None) -> str: ...   # direct call used by Client
+    def __enter__(self) -> "LMHandler": ...   # start()
+    def __exit__(self, *exc: object) -> None: ...   # stop()
 ```
 
 * The server is `ThreadingTCPServer` with `daemon_threads = True` and
@@ -120,21 +165,41 @@ class LMHandler:
 * `port=0` lets the OS pick a free port, so a new handler for each round never
   clashes with an earlier one.
 * **Batched requests:** one request carries all the prompts. The handler runs
-  them concurrently with a `ThreadPoolExecutor(max_workers=batch_max_concurrent)`,
-  keeps the input order, and records a failure for one prompt without failing
-  the others. Threads fit a synchronous `completion()`; an async client
-  could use `asyncio.gather` instead.
+  them concurrently with `ThreadPoolExecutor.map`, which returns results in
+  input order. A failure on one prompt is caught and becomes that prompt's
+  error; the other prompts still succeed. There is no shared results list, so
+  no lock is needed (§6).
+* **Concurrency cap:** every call to `client.completion()` first takes a slot
+  from `_slots`, a `BoundedSemaphore(max_concurrent)`, and gives it back
+  afterwards. That includes direct calls, single `llm_query` calls, and each
+  prompt of a batch. The semaphore covers the whole handler, so the limit
+  holds even when several batches and single calls arrive at once.
 
 ### 3.3 `BaseLM` / `MockLM`
 
 ```python
 class BaseLM(ABC):
+    def __init__(self,
+                 model_name: str,
+                 timeout: float = DEFAULT_TIMEOUT,
+                 sampling_args: dict[str, Any] | None = None,
+                 **kwargs: Any): ...
     model_name: str
+    timeout: float                    # per-call limit for the backend request
+    sampling_args: dict[str, Any]     # e.g. {"temperature": 0.2, "max_tokens": 1024}; {} if None
+    kwargs: dict[str, Any]            # backend-specific options (api_key, base_url, ...)
+
     @abstractmethod
-    def completion(self, prompt: str | list[dict]) -> str: ...
+    def completion(self, prompt: str | dict[str, Any] | list[dict[str, Any]]) -> str: ...
 
 class MockLM(BaseLM):
-    def __init__(self, scripted: list[str] | None = None, model_name="mock"): ...
+    def __init__(self,
+                 scripted: list[str] | None = None,
+                 model_name: str = "mock",
+                 **kwargs: Any): ...           # passed on to BaseLM
+    scripted: list[str]
+    _cursor: int
+    _lock: threading.Lock
 ```
 
 * **Root prompts** (a list of messages from the Client) get the next reply from
@@ -142,7 +207,9 @@ class MockLM(BaseLM):
   out, MockLM returns a fixed final-answer block. The position in the list is
   guarded by a lock.
 * **Sub-queries** (a `str` from `llm_query`) get `f"Mock: {prompt[:50]}"`.
-* **No token cost.** A real client only needs to implement `completion()`.
+* **No token cost.** MockLM accepts `timeout` and `sampling_args` but ignores
+  them. A real client only needs to implement `completion()`, passing
+  `sampling_args` and `timeout` to its API.
 
 ### 3.4 `ContainerManager` + `LMProxyHandler`
 
@@ -150,17 +217,25 @@ class MockLM(BaseLM):
 class ContainerManager:
     def __init__(self,
                  image: str = "python:3.11-slim",
-                 lm_handler_address: tuple[str, int] | None = None,
+                 lm_handler_address: tuple[str, int] | None = None,   # usually set later
                  persistent: bool = False,
                  custom_tools: dict[str, Any] | None = None,
                  exec_timeout: int = 60): ...
-    container_id: str
+    image: str
+    persistent: bool
+    custom_tools: dict[str, Any]
+    exec_timeout: int
+    container_id: str | None
+    temp_dir: str                                 # host side of /workspace
+    proxy_server: ThreadingHTTPServer | None
+    proxy_thread: threading.Thread | None
     proxy_port: int
-    def setup(self) -> None                       # called by __init__
-    def execute_code(self, code: str) -> REPLResult
-    def update_handler_address(self, addr) -> None
-    def cleanup(self) -> None                     # idempotent
-    __enter__ / __exit__                          # __exit__ → cleanup()
+    def setup(self) -> None: ...                  # called by __init__
+    def execute_code(self, code: str) -> REPLResult: ...
+    def update_handler_address(self, address: tuple[str, int]) -> None: ...
+    def cleanup(self) -> None: ...                # idempotent
+    def __enter__(self) -> "ContainerManager": ...
+    def __exit__(self, *exc: object) -> None: ... # cleanup()
 ```
 
 **`setup()`** does the following in order:
@@ -168,7 +243,8 @@ class ContainerManager:
 2. Makes a host temp dir to use as the workspace.
 3. Starts `LMProxyServer = ThreadingHTTPServer(("0.0.0.0", 0), LMProxyHandler)`
    with `daemon_threads = True`, and sets
-   `server.lm_handler_address = lm_handler_address`.
+   `server.lm_handler_address = lm_handler_address`. That is usually `None`
+   at this point; the Client sets the address each round (§3.6).
 4. Runs `docker run -d --rm -v <tmp>:/workspace --add-host host.docker.internal:host-gateway <image> tail -f /dev/null`
    and saves the `container_id` it prints.
 5. Runs `docker exec <id> pip install -q dill requests` (the default install),
@@ -194,7 +270,7 @@ class REPLResult:
     execution_time: float
 ```
 
-**`update_handler_address(addr)`** sets `proxy_server.lm_handler_address = addr`.
+**`update_handler_address(address)`** sets `proxy_server.lm_handler_address = address`.
 It also runs `answer = {"content": "", "ready": False}` in the container, so
 an old `ready=True` from the previous round doesn't end the new round at
 once. The container never sees the change of address.
@@ -276,44 +352,77 @@ class Client:
                  custom_tools: dict[str, Any] | None = None,
                  max_iterations: int = 10,
                  image: str = "python:3.11-slim"): ...
-    def completion(self, prompt: str) -> str        # one round
-    def close(self) -> None                         # cleans up a persistent container
-    __enter__ / __exit__
+    lm: BaseLM
+    persistent: bool
+    custom_tools: dict[str, Any] | None
+    max_iterations: int
+    image: str
+    _env: ContainerManager | None                  # the session's container (persistent)
+    def completion(self, prompt: str) -> str: ...  # one round
+    def close(self) -> None: ...                   # cleans up a persistent container
+    def __enter__(self) -> "Client": ...           # persistent → start the container now
+    def __exit__(self, *exc: object) -> None: ...  # close()
 ```
 
+**Order: container first, then a new LMHandler for each round.** The container
+belongs to the session and the LMHandler belongs to the round. So the
+container is set up before any handler exists (with no handler address yet),
+and each round starts its own handler and points the proxy at it.
+
 ```python
-def completion(self, prompt):
-    with LMHandler(self.lm) as lm_handler:                     # new handler per round
-        if self.persistent and self._env is not None:
-            env = self._env
+def __enter__(self):
+    if self.persistent:
+        self._env = self._new_env()                    # set up once for the session
+    return self
+
+def _new_env(self) -> ContainerManager:
+    return ContainerManager(self.image, persistent=self.persistent,
+                            custom_tools=self.custom_tools)   # no handler address yet
+
+def completion(self, prompt: str) -> str:
+    # 1. Container: the session's one, or a fresh one for this round.
+    if self.persistent:
+        if self._env is None:                          # used without `with`
+            self._env = self._new_env()
+        env = self._env
+    else:
+        env = self._new_env()
+    try:
+        # 2. A new LMHandler for this round; point the proxy at it.
+        with LMHandler(self.lm) as lm_handler:
             env.update_handler_address(lm_handler.address)
-        else:
-            env = ContainerManager(self.image, lm_handler.address,
-                                   self.persistent, self.custom_tools)
-            if self.persistent: self._env = env
-        try:
+            # 3. Iterations.
             messages = build_system_prompt(self.custom_tools) + [user(prompt)]
             for _ in range(self.max_iterations):
                 reply = lm_handler.completion(messages)
                 messages.append(assistant(reply))
-                for code in find_code_blocks(reply):            # r"```repl\s*\n(.*?)\n```"
+                for code in find_code_blocks(reply):        # r"```repl\s*\n(.*?)\n```"
                     result = env.execute_code(code)
                     if result.final_answer is not None:
                         return result.final_answer
                     messages.append(user(format_result(code, result)))
             return lm_handler.completion(messages + [ask_for_final_answer()])
-        finally:
-            if not self.persistent: env.cleanup()
+    finally:
+        if not self.persistent:
+            env.cleanup()
 ```
+
+* Both modes use the same order: container, then handler, then iterations.
+  `persistent` only decides whether the container is reused and when it is
+  removed.
+* **Clean shutdown order.** The LMHandler stops when its `with` block ends.
+  Only after that does `finally` remove a non-persistent container. A
+  persistent container and its proxy stay up until `close()`.
+* **No address before the first round.** Between rounds, and before the first
+  one, the proxy has no live handler. Nothing runs in the container then, so
+  no request can arrive. If one did, the proxy would answer
+  `{"error": "No LM handler configured"}`.
 
 `build_system_prompt()` tells the LM to write ```` ```repl ```` blocks, lists
 `llm_query`, `llm_query_batched` and `SHOW_VARS`, explains `answer["ready"]`,
 and adds the custom tool descriptions.
 
-The LMHandler stops when its `with` block ends. The container and proxy stay
-up if `persistent=True`.
-
-## 4. Sequence (one round)
+## 4. Sequence (session setup, then one round)
 
 ```mermaid
 sequenceDiagram
@@ -324,16 +433,20 @@ sequenceDiagram
     participant P as LMProxyHandler (HTTP)
     participant X as Container (_exec.py)
 
-    U->>C: completion(prompt)
-    C->>H: start() on port 0 → (127.0.0.1, port)
-    alt persistent and container exists
-        C->>M: update_handler_address((host, port))
-        M->>P: server.lm_handler_address = (host, port)
-    else
-        C->>M: ContainerManager(lm_handler_address, persistent, custom_tools)
+    opt persistent: once per session, in Client.__enter__
+        C->>M: ContainerManager(persistent, custom_tools), no handler address
         M->>P: start ThreadingHTTPServer 0.0.0.0:0
         M->>X: docker run … tail -f /dev/null, then pip install dill requests
     end
+    U->>C: completion(prompt)
+    opt not persistent: a fresh container for this round
+        C->>M: ContainerManager(persistent, custom_tools), no handler address
+        M->>P: start ThreadingHTTPServer 0.0.0.0:0
+        M->>X: docker run … tail -f /dev/null, then pip install dill requests
+    end
+    C->>H: start() on port 0 → (127.0.0.1, port)
+    C->>M: update_handler_address((host, port))
+    M->>P: server.lm_handler_address = (host, port)
     loop iteration ≤ max_iterations
         C->>H: completion(messages) (direct call)
         H-->>C: reply text with repl code blocks
@@ -344,7 +457,7 @@ sequenceDiagram
             opt llm_query / llm_query_batched
                 X->>P: HTTP POST /llm_query[_batched]
                 P->>H: TCP [len][JSON LMRequest]
-                H-->>P: TCP [len][JSON LMResponse] (batched: thread pool)
+                H-->>P: TCP [len][JSON LMResponse] (semaphore-limited)
                 P-->>X: HTTP 200 JSON (response or responses)
             end
             X-->>M: stdout JSON (stdout, stderr, locals, final_answer)
@@ -367,10 +480,10 @@ the session lasts beyond the round.
 
 | | `persistent=False` | `persistent=True` |
 |---|---|---|
-| Container + proxy | made at the start of the round, removed at the end | made once, reused until `Client.close()` |
-| LMHandler | new each round | new each round; `update_handler_address()` points the proxy at it |
+| Container + proxy | made at the start of the round, removed at the end | made once in `Client.__enter__`, reused until `Client.close()` |
+| LMHandler | new each round, started after the container; `update_handler_address()` points the proxy at it | same |
 | Variables / saved LM responses | gone after the round | carried into later rounds |
-| `answer` | starts fresh | reset by `update_handler_address()` |
+| `answer` | starts fresh | reset by `update_handler_address()` at the start of each round |
 
 ## 6. Threading and concurrency
 
@@ -384,11 +497,23 @@ the session lasts beyond the round.
   threads at once, and each call gets its own proxy and handler threads. A
   single `llm_query_batched` call fans out inside LMHandler through its thread
   pool.
+* **Batched results need no lock.** `ThreadPoolExecutor.map` collects each
+  prompt's result and returns them in input order, so worker threads never
+  write to a shared list. (If results were written into a shared list by
+  index, each thread would write a different slot. That is also safe in
+  CPython, but `map` makes it clear.) A semaphore isn't the tool for guarding
+  shared data anyway: that is what a `Lock` is for.
+* **A semaphore caps how many LM calls run at once.** `LMHandler._slots` is a
+  `BoundedSemaphore(max_concurrent)`, and every `client.completion()` call
+  holds one slot while it runs. A thread pool only limits its own batch, so
+  two batches plus a few single calls could otherwise exceed the limit. With a
+  real API, the cap keeps you under its rate limits. With the mock it changes
+  nothing, but the code path is the same.
 * **No late requests.** Shutting down the old LMHandler at the end of a round
   is safe. `docker exec` only returns once the `_exec.py` process has exited, so
   no `llm_query` from that round can still be in flight.
-* **Shared state:** the MockLM position in its script uses a lock, and the
-  proxy shares no `requests.Session`.
+* **Shared state that does need a `Lock`:** the MockLM position in its script
+  (`_cursor`). The proxy shares no `requests.Session`.
 
 ## 7. Networking (Linux)
 
