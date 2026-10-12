@@ -448,4 +448,3 @@ Left out for now:
    pointed at a local proxy.
 5. `ContainerManager`, checked with Docker.
 6. `Client` and `examples/docker_repl_example.py`, then the end-to-end test.
- 
