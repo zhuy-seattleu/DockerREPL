@@ -42,7 +42,7 @@ the next.
  │      │  │ LMProxyServer  ThreadingHTTPServer   ││────────────────┘  per call)  │
  │      │  │ 0.0.0.0:<port 0>  handler class =    ││                              │
  │      │  │ LMProxyHandler; reads                ││                              │
- │      │  │ server.lm_handler_address (live)     ││                              │
+ │      │  │ manager.lm_handler_address (live)    ││                              │
  │      │  └──────────────────▲───────────────────┘│                              │
  │      └───────┬─────────────┼────────────────────┘                              │
  │  docker exec │ <id> python │ HTTP POST /llm_query, /llm_query_batched          │
@@ -139,12 +139,9 @@ def send_lm_request_batched(address: tuple[str, int],
 
 ```python
 class LMHandler:
-    def __init__(self, client: BaseLM, host: str = "127.0.0.1", port: int = 0,
-                 max_concurrent: int = 8): ...
+    def __init__(self, client: BaseLM, host: str = "127.0.0.1", port: int = 0): ...
     client: BaseLM
     host: str
-    max_concurrent: int
-    _slots: threading.BoundedSemaphore        # max_concurrent LM calls in flight
     _server: ThreadingTCPServer | None
     _thread: threading.Thread | None
     @property
@@ -165,51 +162,75 @@ class LMHandler:
 * `port=0` lets the OS pick a free port, so a new handler for each round never
   clashes with an earlier one.
 * **Batched requests:** one request carries all the prompts. The handler runs
-  them concurrently with `ThreadPoolExecutor.map`, which returns results in
-  input order. A failure on one prompt is caught and becomes that prompt's
-  error; the other prompts still succeed. There is no shared results list, so
-  no lock is needed (§6).
-* **Concurrency cap:** every call to `client.completion()` first takes a slot
-  from `_slots`, a `BoundedSemaphore(max_concurrent)`, and gives it back
-  afterwards. That includes direct calls, single `llm_query` calls, and each
-  prompt of a batch. The semaphore covers the whole handler, so the limit
-  holds even when several batches and single calls arrive at once.
+  them concurrently with `ThreadPoolExecutor(max_workers=min(len(prompts), client.max_concurrent)).map`,
+  which returns results in input order. A failure on one prompt is caught and
+  becomes that prompt's error; the other prompts still succeed. There is no
+  shared results list, so no lock is needed (§6).
+* **Every LM call goes through `client.completion()`.** That covers the
+  Client's direct call (`LMHandler.completion()`), single `llm_query` requests
+  from the proxy, and each prompt of a batch. LMHandler itself does not limit
+  concurrency; `BaseLM` does (§3.3).
 
 ### 3.3 `BaseLM` / `MockLM`
 
 ```python
+Prompt = str | dict[str, Any] | list[dict[str, Any]]
+
 class BaseLM(ABC):
     def __init__(self,
                  model_name: str,
                  timeout: float = DEFAULT_TIMEOUT,
                  sampling_args: dict[str, Any] | None = None,
+                 max_concurrent: int = 8,
                  **kwargs: Any): ...
     model_name: str
     timeout: float                    # per-call limit for the backend request
     sampling_args: dict[str, Any]     # e.g. {"temperature": 0.2, "max_tokens": 1024}; {} if None
+    max_concurrent: int               # most outgoing requests in flight at once
     kwargs: dict[str, Any]            # backend-specific options (api_key, base_url, ...)
+    _slots: threading.BoundedSemaphore   # BoundedSemaphore(max_concurrent)
+
+    def completion(self, prompt: Prompt) -> str:   # not overridden
+        with self._slots:                          # wait for a free slot
+            return self._completion(prompt)
 
     @abstractmethod
-    def completion(self, prompt: str | dict[str, Any] | list[dict[str, Any]]) -> str: ...
+    def _completion(self, prompt: Prompt) -> str: ...   # the actual backend call
 
 class MockLM(BaseLM):
     def __init__(self,
                  scripted: list[str] | None = None,
                  model_name: str = "mock",
                  **kwargs: Any): ...           # passed on to BaseLM
-    scripted: list[str]
-    _cursor: int
-    _lock: threading.Lock
+    scripted: list[str]               # replies to root prompts, in order
+    _cursor: int                      # index in `scripted` of the next reply; starts at 0
+    _lock: threading.Lock             # guards _cursor
 ```
 
-* **Root prompts** (a list of messages from the Client) get the next reply from
-  `scripted`, which can contain ```` ```repl ```` blocks. When the list runs
-  out, MockLM returns a fixed final-answer block. The position in the list is
-  guarded by a lock.
-* **Sub-queries** (a `str` from `llm_query`) get `f"Mock: {prompt[:50]}"`.
+* **The concurrency cap lives in `BaseLM`.** `BaseLM` is the one object that
+  every outgoing LM request passes through, whichever path it took and
+  whichever round's LMHandler served it. `completion()` is a fixed wrapper
+  that holds one slot of `_slots` while the subclass's `_completion()` runs.
+  So at most `max_concurrent` backend calls are ever in flight for one LM
+  object. Subclasses implement `_completion()` and never override
+  `completion()`, so they can't bypass the cap.
+* **Root prompts** (a `list` of messages, which only the Client sends) get
+  `scripted[_cursor]`, and `_cursor` then moves up by one. So `_cursor` is the
+  index of the next scripted reply. Once `_cursor == len(scripted)`, every
+  further root prompt gets a fixed reply whose ```` ```repl ```` block sets
+  `answer["ready"] = True`. That makes the round end even if the script is
+  too short.
+* **Sub-queries** (a `str` or `dict` from `llm_query`) get
+  `f"Mock: {str(prompt)[:50]}"` and never move `_cursor`. Each scripted reply
+  is therefore used by exactly one root turn, however many `llm_query` calls
+  the code makes in between.
+* **Why `_lock`:** reading `scripted[_cursor]` and adding one to `_cursor` are
+  two steps. Today only the Client's thread sends root prompts, but the lock
+  keeps them atomic if a MockLM is ever shared, for example by two Clients in
+  one test. It costs nothing.
 * **No token cost.** MockLM accepts `timeout` and `sampling_args` but ignores
-  them. A real client only needs to implement `completion()`, passing
-  `sampling_args` and `timeout` to its API.
+  them. A real client implements `_completion()`, passing `sampling_args` and
+  `timeout` to its API.
 
 ### 3.4 `ContainerManager` + `LMProxyHandler`
 
@@ -220,11 +241,12 @@ class ContainerManager:
                  lm_handler_address: tuple[str, int] | None = None,   # usually set later
                  persistent: bool = False,
                  custom_tools: dict[str, Any] | None = None,
-                 exec_timeout: int = 60): ...
+                 exec_timeout: int = 600): ...
     image: str
     persistent: bool
     custom_tools: dict[str, Any]
-    exec_timeout: int
+    exec_timeout: int                             # seconds per execute_code call
+    lm_handler_address: tuple[str, int] | None    # read live by the proxy
     container_id: str | None
     temp_dir: str                                 # host side of /workspace
     proxy_server: ThreadingHTTPServer | None
@@ -241,10 +263,11 @@ class ContainerManager:
 **`setup()`** does the following in order:
 1. Calls `validate_custom_tools()`.
 2. Makes a host temp dir to use as the workspace.
-3. Starts `LMProxyServer = ThreadingHTTPServer(("0.0.0.0", 0), LMProxyHandler)`
-   with `daemon_threads = True`, and sets
-   `server.lm_handler_address = lm_handler_address`. That is usually `None`
-   at this point; the Client sets the address each round (§3.6).
+3. Creates a handler class bound to this manager,
+   `handler_cls = type("Handler", (LMProxyHandler,), {"manager": self})`, then
+   starts `ThreadingHTTPServer(("0.0.0.0", 0), handler_cls)` with
+   `daemon_threads = True`. `self.lm_handler_address` is usually `None` at this
+   point; the Client sets it each round (§3.6).
 4. Runs `docker run -d --rm -v <tmp>:/workspace --add-host host.docker.internal:host-gateway <image> tail -f /dev/null`
    and saves the `container_id` it prints.
 5. Runs `docker exec <id> pip install -q dill requests` (the default install),
@@ -257,7 +280,9 @@ it, as found by `find_code_blocks`. It:
    triple quotes in LM-written code can't break the script.
 2. Writes that script to `<tmp>/_exec.py`, which the container sees as
    `/workspace/_exec.py`.
-3. Runs `docker exec <id> timeout <exec_timeout> python /workspace/_exec.py`.
+3. Runs `docker exec <id> timeout <exec_timeout> python /workspace/_exec.py`,
+   with `subprocess.run(..., timeout=exec_timeout + 10)` as a backstop in case
+   the `docker` command itself hangs.
 4. Parses the last line of stdout as JSON and returns:
 
 ```python
@@ -270,14 +295,49 @@ class REPLResult:
     execution_time: float
 ```
 
-**`update_handler_address(address)`** sets `proxy_server.lm_handler_address = address`.
+**`exec_timeout`** is the most time one `execute_code` call may take. It's
+needed because the LM writes the code, and that code can loop forever
+(`while True:`) or block. Without a limit, `docker exec` would never return.
+The Client's thread would hang and the round could never end. When the limit
+is hit, `timeout` kills the Python process inside the container (exit code
+124). `execute_code` then returns a `REPLResult` with
+`stderr = "Execution timed out after <n> s"` and no final answer, and the LM
+sees that error in its next turn. Because the process died before saving,
+`state.dill` still holds the state from before that code block (§3.5 step 5).
+The default of 600 s is longer than `DEFAULT_TIMEOUT` (300 s), so a slow
+`llm_query` returns its own `"Error: ..."` string before the whole run is
+killed.
+
+**No `setup_code` parameter.** It would be code run once, right after the
+container starts and before the LM's first code block. Only the application
+developer who builds the `Client` could supply it, since the LM hasn't spoken
+yet. It's left out because `custom_tools` already covers its uses. A code
+string may hold any statements, including imports and data loading (for
+example `"import json\nDATA = json.load(open('/workspace/data.json'))"`), and
+it is re-applied before every code block. That also makes it survive a
+non-persistent round or a restarted container. A one-time hook would add a
+second way to do the same thing, plus rules for when it reruns.
+
+**`update_handler_address(address)`** sets `self.lm_handler_address = address`.
 It also runs `answer = {"content": "", "ready": False}` in the container, so
 an old `ready=True` from the previous round doesn't end the new round at
 once. The container never sees the change of address.
 
 **`LMProxyHandler(BaseHTTPRequestHandler)`** has two routes, and every reply is
-JSON. Each route reads `self.server.lm_handler_address` on every request,
-which is what lets the address change from round to round.
+JSON. It declares `manager: ContainerManager` as a class attribute, which is
+filled in by the per-manager subclass made in `setup()` step 3.
+* **Why a subclass made with `type()`:** `ThreadingHTTPServer` creates a new
+  handler instance for each request and calls its constructor itself, so the
+  constructor can't be used to pass in data. Class attributes are the way in.
+  Each ContainerManager makes its own subclass so that two managers in one
+  process never share them. Setting `LMProxyHandler.manager` directly would
+  change it for every manager.
+* **Store a reference, not a copy.** The subclass holds `manager`, the
+  ContainerManager object itself. It doesn't copy the manager's values, such
+  as `{"lm_handler_address": ...}`. Each request reads
+  `self.manager.lm_handler_address` when it starts, so the new address set at
+  the start of each round is seen at once. A copied tuple would be stuck at
+  whatever address existed when the class was made.
 * `POST /llm_query` with `{"prompt", "model"}` makes one framed TCP request to
   LMHandler and returns `{"response"}` or `{"error"}`.
 * `POST /llm_query_batched` with `{"prompts", "model"}` makes one framed TCP
@@ -338,7 +398,9 @@ code = base64.b64decode("<code_b64>").decode()
   3. Build the namespace from the helpers plus the custom tools.
   4. `exec(code)`, with stdout and stderr captured to buffers.
   5. Save every variable that dill can pickle and whose name doesn't start
-     with `_`.
+     with `_`. The save writes `state.dill.tmp` and then calls `os.replace`
+     to rename it over `state.dill`. If the process is killed mid-save, the
+     old file is left whole.
   6. Print one JSON line: `{stdout, stderr, locals, final_answer}`.
 * **Saved LM responses** are just variables. For example, `r = llm_query(...)`
   is still there in the next exec, and in the next round if `persistent=True`.
@@ -435,18 +497,18 @@ sequenceDiagram
 
     opt persistent: once per session, in Client.__enter__
         C->>M: ContainerManager(persistent, custom_tools), no handler address
-        M->>P: start ThreadingHTTPServer 0.0.0.0:0
+        M->>P: start ThreadingHTTPServer 0.0.0.0:0 with Handler bound to manager
         M->>X: docker run … tail -f /dev/null, then pip install dill requests
     end
     U->>C: completion(prompt)
     opt not persistent: a fresh container for this round
         C->>M: ContainerManager(persistent, custom_tools), no handler address
-        M->>P: start ThreadingHTTPServer 0.0.0.0:0
+        M->>P: start ThreadingHTTPServer 0.0.0.0:0 with Handler bound to manager
         M->>X: docker run … tail -f /dev/null, then pip install dill requests
     end
     C->>H: start() on port 0 → (127.0.0.1, port)
     C->>M: update_handler_address((host, port))
-    M->>P: server.lm_handler_address = (host, port)
+    M->>M: self.lm_handler_address = (host, port), read live by the proxy
     loop iteration ≤ max_iterations
         C->>H: completion(messages) (direct call)
         H-->>C: reply text with repl code blocks
@@ -503,17 +565,25 @@ the session lasts beyond the round.
   index, each thread would write a different slot. That is also safe in
   CPython, but `map` makes it clear.) A semaphore isn't the tool for guarding
   shared data anyway: that is what a `Lock` is for.
-* **A semaphore caps how many LM calls run at once.** `LMHandler._slots` is a
-  `BoundedSemaphore(max_concurrent)`, and every `client.completion()` call
-  holds one slot while it runs. A thread pool only limits its own batch, so
-  two batches plus a few single calls could otherwise exceed the limit. With a
-  real API, the cap keeps you under its rate limits. With the mock it changes
-  nothing, but the code path is the same.
+* **A semaphore caps how many LM calls run at once.** `BaseLM._slots` is a
+  `BoundedSemaphore(max_concurrent)`. `BaseLM.completion()` holds one slot
+  for every outgoing request: the Client's direct call, single `llm_query`
+  calls, and each prompt of a batch. A thread pool only limits its own batch,
+  so two batches plus a few single calls could otherwise go over the limit.
+  The semaphore belongs to the LM object rather than to the LMHandler, so the
+  cap still holds across rounds (each round has a new LMHandler) and across
+  Clients that share one LM. With a real API, the cap keeps you under its
+  rate limits. With the mock it changes nothing, but the code path is the
+  same.
 * **No late requests.** Shutting down the old LMHandler at the end of a round
   is safe. `docker exec` only returns once the `_exec.py` process has exited, so
   no `llm_query` from that round can still be in flight.
 * **Shared state that does need a `Lock`:** the MockLM position in its script
-  (`_cursor`). The proxy shares no `requests.Session`.
+  (`_cursor`).
+* **Proxy reads need no lock.** The proxy only reads
+  `manager.lm_handler_address`, and the Client replaces the whole tuple in one
+  assignment. A request sees either the old address or the new one, never a
+  mix. The proxy shares no `requests.Session`.
 
 ## 7. Networking (Linux)
 
