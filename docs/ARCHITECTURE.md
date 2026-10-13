@@ -79,7 +79,7 @@ import socket
 from dataclasses import dataclass, field
 from typing import Any
 
-DEFAULT_TIMEOUT: int = 300                     # seconds; shared by comms and BaseLM
+DEFAULT_TIMEOUT: int = 300                     # seconds; defined in constants.py, shared by comms and BaseLM
 
 @dataclass
 class LMRequest:                               # proxy → handler
@@ -263,10 +263,11 @@ class ContainerManager:
 **`setup()`** does the following in order:
 1. Calls `validate_custom_tools()`.
 2. Makes a host temp dir to use as the workspace.
-3. Creates a handler class bound to this manager,
-   `handler_cls = type("Handler", (LMProxyHandler,), {"manager": self})`, then
-   starts `ThreadingHTTPServer(("0.0.0.0", 0), handler_cls)` with
-   `daemon_threads = True`. `self.lm_handler_address` is usually `None` at this
+3. Calls `start_proxy_server(self, "0.0.0.0", 0)` from `environments/proxy.py`.
+   It creates a handler class bound to this manager,
+   `type("Handler", (LMProxyHandler,), {"manager": self})`, and starts
+   `ThreadingHTTPServer(("0.0.0.0", 0), handler_cls)` with
+   `daemon_threads = True` in a daemon thread. `self.lm_handler_address` is usually `None` at this
    point; the Client sets it each round (§3.6).
 4. Runs `docker run -d --rm -v <tmp>:/workspace --add-host host.docker.internal:host-gateway <image> tail -f /dev/null`
    and saves the `container_id` it prints.
@@ -275,7 +276,7 @@ class ContainerManager:
 
 **`execute_code(code: str)`** takes the code block exactly as the LM wrote
 it, as found by `find_code_blocks`. It:
-1. Builds a complete script with `_build_exec_script(code, proxy_port, custom_tools)`
+1. Builds a complete script with `_build_exec_script(code, f"http://host.docker.internal:{proxy_port}", custom_tools)`
    (§3.5). The code is embedded **base64-encoded**, so quotes, backslashes and
    triple quotes in LM-written code can't break the script.
 2. Writes that script to `<tmp>/_exec.py`, which the container sees as
@@ -372,11 +373,16 @@ custom_tools = {
 
 ### 3.5 `_build_exec_script()` → `_exec.py` (one process per exec)
 
-On the host, `_build_exec_script(code, proxy_port, custom_tools) -> str`
-fills in a template. The generated `_exec.py` then runs in the container:
+On the host,
+`_build_exec_script(code: str, proxy_url: str, custom_tools: dict[str, Any] | None = None, workspace: str = "/workspace") -> str`
+fills in a template. The generated `_exec.py` then runs in the container.
+`proxy_url` and `workspace` are parameters rather than fixed values. That lets
+the same script run on the host in unit tests, against a local proxy and a
+temporary directory.
 
 ```python
-PROXY = "http://host.docker.internal:<proxy_port>"          # filled in by the host
+PROXY = "<proxy_url>"                                       # http://host.docker.internal:<port> in the container
+STATE = "<workspace>/state.dill
 def llm_query(prompt, model=None) -> str                    # POST /llm_query
 def llm_query_batched(prompts, model=None) -> list[str]     # POST /llm_query_batched
 def SHOW_VARS() -> str                                      # list REPL variables, no network
@@ -599,25 +605,29 @@ the session lasts beyond the round.
 
 ```
 dockerrepl/
+  constants.py           # DEFAULT_TIMEOUT
+  parsing.py             # REPL_BLOCK_PATTERN, find_code_blocks
+  clients/
+    base_lm.py           # Prompt, BaseLM
+    mock_lm.py           # MOCK_FINAL_REPLY, MockLM
   comms.py               # LMRequest/LMResponse, socket_send/recv/request, send_lm_request[_batched]
   lm_handler.py          # LMHandler (ThreadingTCPServer)
-  clients/
-    base_lm.py           # BaseLM
-    mock_lm.py           # MockLM
   environments/
-    tools.py             # validate_custom_tools, format_tools_for_prompt, RESERVED_TOOL_NAMES
-    container_manager.py # ContainerManager, LMProxyHandler, REPLResult
+    tools.py             # RESERVED_TOOL_NAMES, validate_custom_tools, format_tools_for_prompt
     exec_script.py       # _build_exec_script, _build_custom_tools_code (template for _exec.py)
-  client.py              # Client, find_code_blocks, prompt helpers
+    proxy.py             # LMProxyHandler, make_handler_class, start_proxy_server
+    container_manager.py # REPLResult, ContainerManager
+  client.py              # Client, build_system_prompt, format_result
 examples/
   docker_repl_example.py # exec, llm_query, llm_query_batched, SHOW_VARS, tools, persistent
 tests/
-  test_comms.py          # framing round-trip, partial reads, closed connection
-  test_lm_handler.py     # single + batched over real sockets, no Docker
-  test_proxy.py          # proxy ↔ handler over loopback, no Docker
-  test_exec_script.py    # generated _exec.py run as a local subprocess, no Docker
-  test_e2e.py            # Client + MockLM + Docker (skipped if Docker is missing)
+  conftest.py            # skips @pytest.mark.docker tests when Docker isn't running
+  test_<component>.py    # one file per build step; see docs/build/
 ```
+
+The proxy lives in its own module. It only needs an object with a
+`lm_handler_address` attribute, so it can be tested without a
+ContainerManager or Docker.
 
 ## 9. Scope
 
@@ -635,11 +645,20 @@ Left out for now:
 
 ## 10. Build order
 
-1. `comms.py` and its tests.
-2. `BaseLM`, `MockLM` and `LMHandler`, tested over sockets.
-3. `LMProxyHandler` and `tools.py`, tested against a real LMHandler with no
-   Docker.
-4. `exec_script.py`: build a script and run it locally as a subprocess,
-   pointed at a local proxy.
-5. `ContainerManager`, checked with Docker.
-6. `Client` and `examples/docker_repl_example.py`, then the end-to-end test.
+The system is built in 11 steps, each one component plus its unit tests. The
+step-by-step guide is in [`docs/build/`](build/README.md). Steps 0–7 and 9
+run without Docker. Only steps 8 (partly) and 10 need a Docker daemon.
+
+| Step | Component |
+|---|---|
+| 0 | project setup, pytest, `docker` test marker |
+| 1 | `find_code_blocks` |
+| 2 | `BaseLM`, `MockLM` |
+| 3 | `comms.py` |
+| 4 | `LMHandler` |
+| 5 | `custom_tools` validation |
+| 6 | `_build_exec_script` (run locally) |
+| 7 | `LMProxyHandler` (+ local integration with steps 4 and 6) |
+| 8 | `ContainerManager` |
+| 9 | `Client` |
+| 10 | end-to-end tests and example |
