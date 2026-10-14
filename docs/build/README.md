@@ -25,7 +25,7 @@ run on any machine with Python.
 
 | Step | Feature | New files | Tests | Docker? | Main ideas |
 |---|---|---|---|---|---|
-| [0](step-00-setup.md) | Project setup | `pyproject.toml`, package skeleton, `tests/conftest.py` | smoke test | no | packaging, pytest, test markers |
+| [0](step-00-setup.md) | Project setup + CI | `pyproject.toml`, package skeleton, `tests/conftest.py`, `.github/workflows/tests.yml` | smoke test | no | packaging, virtual environments, pytest, test markers, GitHub Actions |
 | [1](step-01-parsing.md) | Extract `repl` code blocks | `parsing.py` | `test_parsing.py` | no | regular expressions |
 | [2](step-02-lm-clients.md) | `BaseLM` + `MockLM` | `constants.py`, `clients/` | `test_lm_clients.py` | no | ABCs, template method, semaphores, locks |
 | [3](step-03-comms.md) | Length-prefixed JSON over TCP | `comms.py` | `test_comms.py` | no | TCP streams, framing, `struct` |
