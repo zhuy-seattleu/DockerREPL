@@ -464,7 +464,7 @@ def completion(self, prompt: str) -> str:
             for _ in range(self.max_iterations):
                 reply = lm_handler.completion(messages)
                 messages.append(assistant(reply))
-                for code in find_code_blocks(reply):        # r"```repl\s*\n(.*?)\n```"
+                for code in find_code_blocks(reply):        # see dockerrepl/parsing.py
                     result = env.execute_code(code)
                     if result.final_answer is not None:
                         return result.final_answer
