@@ -20,7 +20,7 @@ tiny echo server written inside the test file.
 
 ## Depends on
 
-Steps 0 and 2 (`DEFAULT_TIMEOUT`).
+Steps 0 and 2 (`DEFAULT_TIMEOUT`, and the `Prompt` type from `dockerrepl.clients`).
 
 ## Files
 
@@ -33,9 +33,9 @@ Steps 0 and 2 (`DEFAULT_TIMEOUT`).
 
 ```python
 @dataclass
-class LMRequest:
-    prompt: str | dict[str, Any] | None = None
-    prompts: list[str | dict[str, Any]] | None = None
+class LMRequest:                     # Prompt = str | dict[str, Any], from step 2
+    prompt: Prompt | None = None
+    prompts: list[Prompt] | None = None
     model: str | None = None
     @property
     def is_batched(self) -> bool: ...                 # prompts is a non-empty list
@@ -61,7 +61,7 @@ def socket_request(address: tuple[str, int], data: dict,
 def send_lm_request(address: tuple[str, int], request: LMRequest,
                     timeout: int = DEFAULT_TIMEOUT) -> LMResponse: ...
 def send_lm_request_batched(address: tuple[str, int],
-                            prompts: list[str | dict[str, Any]],
+                            prompts: list[Prompt],
                             model: str | None = None,
                             timeout: int = DEFAULT_TIMEOUT) -> list[LMResponse]: ...
 ```
