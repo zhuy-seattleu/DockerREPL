@@ -38,11 +38,11 @@ Step 1 (`find_code_blocks`), step 2 (`MockLM`), step 4 (`LMHandler`), step 5
 ## Interface
 
 ```python
-Message = dict[str, Any]           # {"role": "system" | "user" | "assistant", "content": str}
+# Messages (step 2) = list[dict[str, Any]]; each dict is {"role": "system" | "user" | "assistant", "content": str}
 
-def build_system_prompt(custom_tools: dict[str, Any] | None) -> list[Message]: ...
+def build_system_prompt(custom_tools: dict[str, Any] | None) -> Messages: ...
 def format_result(code: str, result: REPLResult) -> str: ...
-FINAL_ANSWER_REQUEST: Message      # user message asking for a final answer
+FINAL_ANSWER_REQUEST: dict[str, Any]   # user message asking for a final answer
 
 class Client:
     def __init__(self, lm: BaseLM, persistent: bool = False,

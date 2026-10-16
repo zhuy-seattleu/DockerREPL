@@ -21,6 +21,8 @@ the next.
 | **session** | The lifetime of one container, together with its proxy and `state.dill`. |
 | **round** | One `Client.completion(prompt)` call. Each round gets a **new LMHandler**. |
 | **iteration** | One LM reply inside a round, plus running its code blocks. A round has at most `max_iterations` iterations. |
+| **root conversation** | The `Messages` the Client sends to drive a round: system prompt, the user's question, the LM's replies and code results. Type `list[dict[str, Any]]`. |
+| **sub-query** | A `Prompt` that LM-written code sends from the container with `llm_query` or `llm_query_batched`. Type `str` or `dict[str, Any]`. |
 
 ## 2. Component diagram
 
@@ -130,10 +132,11 @@ def send_lm_request_batched(address: tuple[str, int],
 * **One batched request, a list back.** On the wire, a batched reply is one
   `LMResponse` whose `responses` holds one `LMResponse` per prompt.
   `send_lm_request_batched` unpacks that into the `list[LMResponse]` it returns.
-* **Prompt types.** `LMRequest.prompt` is `str | dict[str, Any]`. Code in the
-  container sends a `str`, or a `dict` for a structured prompt. The Client's
-  whole conversation is a `list[dict[str, Any]]` of messages. It never crosses
-  the socket, because the Client calls `LMHandler.completion()` directly (§3.2).
+* **Prompt types.** `LMRequest.prompt` is a `Prompt` (`str | dict[str, Any]`,
+  defined in §3.3): code in the container sends a `str`, or a `dict` for a
+  structured prompt. The Client's root conversation is `Messages`
+  (`list[dict[str, Any]]`). It never crosses the socket, because the Client
+  calls `LMHandler.completion()` directly (§3.2).
 
 ### 3.2 `LMHandler`
 
@@ -148,7 +151,7 @@ class LMHandler:
     def address(self) -> tuple[str, int]: ... # real port, read after start()
     def start(self) -> tuple[str, int]: ...
     def stop(self) -> None: ...
-    def completion(self, prompt: str | dict[str, Any] | list[dict[str, Any]],
+    def completion(self, prompt: Prompt | Messages,
                    model: str | None = None) -> str: ...   # direct call used by Client
     def __enter__(self) -> "LMHandler": ...   # start()
     def __exit__(self, *exc: object) -> None: ...   # stop()
@@ -174,7 +177,8 @@ class LMHandler:
 ### 3.3 `BaseLM` / `MockLM`
 
 ```python
-Prompt = str | dict[str, Any] | list[dict[str, Any]]
+Prompt = str | dict[str, Any]          # one sub-query from the container
+Messages = list[dict[str, Any]]        # the Client's root conversation
 
 class BaseLM(ABC):
     def __init__(self,
@@ -190,19 +194,19 @@ class BaseLM(ABC):
     kwargs: dict[str, Any]            # backend-specific options (api_key, base_url, ...)
     _slots: threading.BoundedSemaphore   # BoundedSemaphore(max_concurrent)
 
-    def completion(self, prompt: Prompt) -> str:   # not overridden
-        with self._slots:                          # wait for a free slot
+    def completion(self, prompt: Prompt | Messages) -> str:   # overriding it raises TypeError
+        with self._slots:                                     # wait for a free slot
             return self._completion(prompt)
 
     @abstractmethod
-    def _completion(self, prompt: Prompt) -> str: ...   # the actual backend call
+    def _completion(self, prompt: Prompt | Messages) -> str: ...   # the actual backend call
 
 class MockLM(BaseLM):
     def __init__(self,
                  scripted: list[str] | None = None,
                  model_name: str = "mock",
                  **kwargs: Any): ...           # passed on to BaseLM
-    scripted: list[str]               # replies to root prompts, in order
+    scripted: list[str]               # replies to the root conversation, in order
     _cursor: int                      # index in `scripted` of the next reply; starts at 0
     _lock: threading.Lock             # guards _cursor
 ```
@@ -212,12 +216,13 @@ class MockLM(BaseLM):
   whichever round's LMHandler served it. `completion()` is a fixed wrapper
   that holds one slot of `_slots` while the subclass's `_completion()` runs.
   So at most `max_concurrent` backend calls are ever in flight for one LM
-  object. Subclasses implement `_completion()` and never override
-  `completion()`, so they can't bypass the cap.
-* **Root prompts** (a `list` of messages, which only the Client sends) get
-  `scripted[_cursor]`, and `_cursor` then moves up by one. So `_cursor` is the
-  index of the next scripted reply. Once `_cursor == len(scripted)`, every
-  further root prompt gets a fixed reply whose ```` ```repl ```` block sets
+  object. Subclasses implement `_completion()`. `BaseLM.__init_subclass__`
+  raises `TypeError` if a subclass overrides `completion()`, so none can
+  bypass the cap.
+* **The root conversation** (a `list` of messages, which only the Client
+  sends) gets `scripted[_cursor]`, and `_cursor` then moves up by one. So
+  `_cursor` is the index of the next scripted reply. Once
+  `_cursor == len(scripted)`, every further root turn gets a fixed reply whose ```` ```repl ```` block sets
   `answer["ready"] = True`. That makes the round end even if the script is
   too short.
 * **Sub-queries** (a `str` or `dict` from `llm_query`) get
@@ -225,7 +230,7 @@ class MockLM(BaseLM):
   is therefore used by exactly one root turn, however many `llm_query` calls
   the code makes in between.
 * **Why `_lock`:** reading `scripted[_cursor]` and adding one to `_cursor` are
-  two steps. Today only the Client's thread sends root prompts, but the lock
+  two steps. Today only the Client's thread sends root turns, but the lock
   keeps them atomic if a MockLM is ever shared, for example by two Clients in
   one test. It costs nothing.
 * **No token cost.** MockLM accepts `timeout` and `sampling_args` but ignores
@@ -608,7 +613,7 @@ dockerrepl/
   constants.py           # DEFAULT_TIMEOUT
   parsing.py             # REPL_BLOCK_PATTERN, find_code_blocks
   clients/
-    base_lm.py           # Prompt, BaseLM
+    base_lm.py           # Prompt, Messages, BaseLM
     mock_lm.py           # MOCK_FINAL_REPLY, MockLM
   comms.py               # LMRequest/LMResponse, socket_send/recv/request, send_lm_request[_batched]
   lm_handler.py          # LMHandler (ThreadingTCPServer)
