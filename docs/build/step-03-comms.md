@@ -106,6 +106,41 @@ def send_lm_request_batched(address: tuple[str, int],
 `timeout` is a `float` (seconds) rather than an `int`, so tests can use short
 timeouts such as `0.5`. Passing an `int` like `DEFAULT_TIMEOUT` still works.
 
+### Why `responses` is `list[LMResponse]`, not `list[str]`
+
+In a batch, **each prompt can succeed or fail on its own**. For example, the
+backend may hit a rate limit on the second of three prompts. A plain string
+can't say which happened:
+
+```python
+["The capital is Paris.", "Error: rate limit exceeded", "42"]   # list[str]: is item 2 an error,
+                                                                # or an answer that starts with "Error:"?
+```
+
+Each `LMResponse` keeps the answer and the error in separate fields, so
+nothing has to be guessed:
+
+```python
+[LMResponse(response="The capital is Paris."),
+ LMResponse(error="rate limit exceeded"),
+ LMResponse(response="42")]                     # [r.success for r in ...] == [True, False, True]
+```
+
+This also means:
+
+* **One type for single and batched replies.** `if r.success: ... else: ...`
+  works the same everywhere.
+* **Room to grow.** Per-prompt details added later, such as token counts, go
+  into `LMResponse`, and batches get them automatically.
+* **No lists out of step.** Two parallel lists, `responses: list[str]` and
+  `errors: list[str]`, would also work, but they can get out of step with each
+  other. One list of self-contained items can't.
+
+The simplification to `list[str]` happens only at the edge, inside the
+container. There, `llm_query_batched()` returns plain strings, and the proxy
+(step 7) turns a failed slot into `"Error: ..."`, because LM-written code
+should stay simple.
+
 ## Implementation guide
 
 1. **Dataclasses first.**
