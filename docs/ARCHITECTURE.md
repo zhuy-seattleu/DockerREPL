@@ -178,6 +178,10 @@ class LMHandler:
   `allow_reuse_address = True`. Its request handler is a
   `StreamRequestHandler` that does `socket_recv`, then dispatches, then
   `socket_send`. Each connection gets its own thread.
+* The request handler sets `timeout = DEFAULT_TIMEOUT`, so a client that
+  stalls mid-message can't hold a thread forever. A timeout or dropped
+  connection while reading ends that handler quietly. A malformed request
+  (bad JSON, too large) gets an `LMResponse(error="Bad request: ...")`.
 * `serve_forever()` runs in a daemon `Thread`.
 * `port=0` lets the OS pick a free port, so a new handler for each round never
   clashes with an earlier one.
