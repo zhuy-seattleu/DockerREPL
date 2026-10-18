@@ -31,6 +31,7 @@ Step 2 (`BaseLM`, `MockLM`) and step 3 (`comms`).
 
 ```python
 class LMRequestHandler(socketserver.StreamRequestHandler):
+    timeout: float = DEFAULT_TIMEOUT       # socketserver applies it to each connection
     def handle(self) -> None: ...          # socket_recv → dispatch → socket_send
 
 class ThreadingLMServer(socketserver.ThreadingTCPServer):
@@ -55,9 +56,20 @@ class LMHandler:
 
 ## Implementation guide
 
-1. **`LMRequestHandler.handle`:**
-   - `data = socket_recv(self.connection)`. If it's `{}`, return (the client
-     went away).
+1. **`LMRequestHandler.timeout = DEFAULT_TIMEOUT`** (a class attribute).
+   `StreamRequestHandler` calls `settimeout()` on every connection with it.
+   Without it, a client that sends half a message and then stalls, without
+   closing, would block that handler thread forever.
+2. **`LMRequestHandler.handle`:**
+   - Read the request with `data = socket_recv(self.connection)`, inside
+     `try`:
+     - `except OSError: return`. This covers `TimeoutError` (the client
+       stalled) and `ConnectionError` (it closed part-way). The request never
+       fully arrived, so there's nobody to answer.
+     - `except ValueError as e:` (invalid JSON, not an object, too large).
+       The client is still connected, so reply with
+       `LMResponse(error=f"Bad request: {e}")` and return.
+   - If `data` is `{}`, return (the client went away).
    - `request = LMRequest.from_dict(data)` and
      `handler = self.server.lm_handler`.
    - **Batched:** call `self._batched(...)`.
@@ -68,24 +80,24 @@ class LMHandler:
    - Send the response with `socket_send(self.connection, response.to_dict())`.
      Wrap the send in `try/except OSError: pass`, because the client may
      already have disconnected.
-2. **`_batched`:**
+3. **`_batched`:**
    - Write a helper `one(p)` that returns `LMResponse(response=client.completion(p))`,
      or `LMResponse(error=str(e))` if it raises.
    - Run the helper over all prompts with
      `ThreadPoolExecutor(max_workers=min(len(prompts), client.max_concurrent)).map(one, prompts)`
      inside a `with` block.
    - Return `LMResponse(responses=list(results))`.
-3. **`start()`:**
+4. **`start()`:**
    - Create `ThreadingLMServer((host, port), LMRequestHandler)` and set
      `server.lm_handler = self`.
    - Start `Thread(target=server.serve_forever, daemon=True)`.
    - Return `self.address`. If called again, return the address without
      starting a second server.
-4. **`address`** returns `(self.host, self._server.server_address[1])` once
+5. **`address`** returns `(self.host, self._server.server_address[1])` once
    started. Port 0 has become a real port by then.
-5. **`stop()`:** `shutdown()`, then `server_close()`, then `join` the thread,
+6. **`stop()`:** `shutdown()`, then `server_close()`, then `join` the thread,
    then set both attributes to `None`. A second call does nothing.
-6. **`completion()`** is the direct path:
+7. **`completion()`** is the direct path:
    `return self.client.completion(prompt)`. It goes through the same
    `BaseLM.completion`, so the same concurrency cap applies.
 
@@ -109,6 +121,8 @@ Test LMs: `MockLM`, `SlowLM` (sleeps 0.2 s, then returns `"slow"`), and
 | `test_two_handlers_coexist` | two handlers on port 0 get different ports and both answer |
 | `test_stop_is_idempotent` | calling `stop()` twice doesn't raise |
 | `test_client_disconnect_does_not_crash_server` | open a socket, send half a frame, close it; the next normal request still succeeds |
+| `test_stalled_client_times_out` | with `LMRequestHandler.timeout` patched to 0.5 s, a client sends 2 header bytes and then waits without closing. The server closes that connection (the client's `recv()` returns `b""`) within a few seconds, and meanwhile a normal request from another client still succeeds |
+| `test_malformed_request_gets_error_reply` | a frame whose payload is invalid JSON gets an `LMResponse` with `error` starting `"Bad request"`, and the server keeps working |
 
 ## Run
 
@@ -125,6 +139,12 @@ pytest -q tests/test_lm_handler.py
 
 ## Pitfalls
 
+* **No `timeout` on the request handler.** `StreamRequestHandler` sockets
+  wait forever by default, so a client that stalls mid-message pins a server
+  thread for good. `test_stalled_client_times_out` catches it.
+* **Not catching `OSError` around `socket_recv`.** A timeout or a dropped
+  connection then escapes `handle()`, and socketserver prints a traceback for
+  something that's normal on a network.
 * **Forgetting `daemon_threads = True`.** Leftover request threads keep the
   test process alive after the tests finish.
 * **Calling `shutdown()` from inside a request handler.** It deadlocks.

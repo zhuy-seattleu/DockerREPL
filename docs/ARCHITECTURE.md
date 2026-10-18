@@ -77,21 +77,22 @@ Only the parameters listed here are in the MVP.
 ### 3.1 `comms.py`
 
 ```python
-import socket
-from dataclasses import dataclass, field
-from typing import Any
+from dockerrepl.clients.base_lm import Prompt          # str | dict[str, Any], see §3.3
+from dockerrepl.constants import DEFAULT_TIMEOUT       # 300 seconds, shared with BaseLM
 
-DEFAULT_TIMEOUT: int = 300                     # seconds; defined in constants.py, shared by comms and BaseLM
+HEADER_FORMAT = ">I"                  # 4-byte big-endian unsigned length
+HEADER_SIZE = 4
+MAX_MESSAGE_BYTES = 64 * 1024 * 1024  # larger messages are refused, in both directions
 
 @dataclass
 class LMRequest:                               # proxy → handler
-    prompt: str | dict[str, Any] | None = None             # single
-    prompts: list[str | dict[str, Any]] | None = None      # batched
+    prompt: Prompt | None = None               # single
+    prompts: list[Prompt] | None = None        # batched
     model: str | None = None
 
     @property
     def is_batched(self) -> bool: ...          # prompts is a non-empty list
-    def to_dict(self) -> dict[str, Any]: ...
+    def to_dict(self) -> dict[str, Any]: ...   # leaves out None fields
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "LMRequest": ...
 
@@ -103,7 +104,7 @@ class LMResponse:                              # handler → proxy
 
     @property
     def success(self) -> bool: ...             # error is None
-    def to_dict(self) -> dict[str, Any]: ...
+    def to_dict(self) -> dict[str, Any]: ...   # leaves out None fields; nests responses
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "LMResponse": ...
 
@@ -112,26 +113,42 @@ def socket_send(sock: socket.socket, data: dict) -> None:
 def socket_recv(sock: socket.socket) -> dict:
     """Read the 4-byte length, then loop until that many bytes have arrived."""
 def socket_request(address: tuple[str, int], data: dict,
-                   timeout: int = DEFAULT_TIMEOUT) -> dict:
+                   timeout: float = DEFAULT_TIMEOUT) -> dict:
     """Open a new TCP connection, send one message, read one reply, close."""
 def send_lm_request(address: tuple[str, int], request: LMRequest,
-                    timeout: int = DEFAULT_TIMEOUT) -> LMResponse:
-    """Never raises: a connection or decode failure becomes LMResponse(error=...)."""
+                    timeout: float = DEFAULT_TIMEOUT) -> LMResponse:
+    """Never raises: any failure becomes LMResponse(error=...)."""
 def send_lm_request_batched(address: tuple[str, int],
-                            prompts: list[str | dict[str, Any]],
+                            prompts: list[Prompt],
                             model: str | None = None,
-                            timeout: int = DEFAULT_TIMEOUT) -> list[LMResponse]:
+                            timeout: float = DEFAULT_TIMEOUT) -> list[LMResponse]:
     """One framed request for all prompts. Returns one LMResponse per prompt,
     in order. If the whole call fails, every slot gets the same error."""
 ```
 
+* **The payload is real UTF-8.** `json.dumps(data, ensure_ascii=False)`, so
+  non-English text isn't inflated into `\uXXXX` escapes. The length prefix
+  counts **bytes**, not characters.
 * **`socket_recv` reads in a loop.** `recv` can return fewer bytes than asked
-  for, so it keeps reading until it has all `length` bytes. If the connection
-  closes before the 4-byte length arrives, it returns `{}`. If it closes partway
-  through the payload, it raises `ConnectionError`.
+  for, so it keeps reading until it has all `length` bytes, for the 4-byte
+  header too.
+  - The connection closes before any header byte: it returns `{}`.
+  - It closes part-way through the header or payload: it raises
+    `ConnectionError`.
+  - The header claims more than `MAX_MESSAGE_BYTES`: it raises `ValueError`
+    without allocating anything. The proxy listens on every network
+    interface, so a malformed header must not be able to request gigabytes.
+  - The payload isn't a JSON object: it raises `ValueError`.
+* **`send_lm_request` checks for a missing reply.** If the server closes
+  without answering, `socket_recv` returns `{}`. Taken at face value, that
+  would look like a success with no response, so it becomes an error.
 * **One batched request, a list back.** On the wire, a batched reply is one
   `LMResponse` whose `responses` holds one `LMResponse` per prompt.
-  `send_lm_request_batched` unpacks that into the `list[LMResponse]` it returns.
+  `send_lm_request_batched` unpacks that into the `list[LMResponse]` it
+  returns. If the count doesn't match the prompts, every slot gets an error,
+  so answers can never be paired with the wrong prompts.
+* **`timeout` is a `float`** (seconds), so tests can use short timeouts such
+  as `0.5`. An `int` such as `DEFAULT_TIMEOUT` works too.
 * **Prompt types.** `LMRequest.prompt` is a `Prompt` (`str | dict[str, Any]`,
   defined in §3.3): code in the container sends a `str`, or a `dict` for a
   structured prompt. The Client's root conversation is `Messages`
@@ -161,6 +178,10 @@ class LMHandler:
   `allow_reuse_address = True`. Its request handler is a
   `StreamRequestHandler` that does `socket_recv`, then dispatches, then
   `socket_send`. Each connection gets its own thread.
+* The request handler sets `timeout = DEFAULT_TIMEOUT`, so a client that
+  stalls mid-message can't hold a thread forever. A timeout or dropped
+  connection while reading ends that handler quietly. A malformed request
+  (bad JSON, too large) gets an `LMResponse(error="Bad request: ...")`.
 * `serve_forever()` runs in a daemon `Thread`.
 * `port=0` lets the OS pick a free port, so a new handler for each round never
   clashes with an earlier one.
