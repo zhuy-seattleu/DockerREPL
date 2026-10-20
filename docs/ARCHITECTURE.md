@@ -162,10 +162,10 @@ class LMHandler:
     def __init__(self, client: BaseLM, host: str = "127.0.0.1", port: int = 0): ...
     client: BaseLM
     host: str
-    _server: ThreadingTCPServer | None
+    _server: ThreadingLMServer | None         # a ThreadingTCPServer subclass
     _thread: threading.Thread | None
     @property
-    def address(self) -> tuple[str, int]: ... # real port, read after start()
+    def address(self) -> tuple[str, int]: ... # real port; RuntimeError before start()
     def start(self) -> tuple[str, int]: ...
     def stop(self) -> None: ...
     def completion(self, prompt: Prompt | Messages,
@@ -174,15 +174,24 @@ class LMHandler:
     def __exit__(self, *exc: object) -> None: ...   # stop()
 ```
 
-* The server is `ThreadingTCPServer` with `daemon_threads = True` and
-  `allow_reuse_address = True`. Its request handler is a
+* The server is `ThreadingLMServer`, a `ThreadingTCPServer` with
+  `daemon_threads = True`, `allow_reuse_address = True` and
+  `request_queue_size = 128`. The listen-queue default of 5 would drop
+  connections beyond the fifth simultaneous one; they're only retried about a
+  second later. Its request handler is a
   `StreamRequestHandler` that does `socket_recv`, then dispatches, then
   `socket_send`. Each connection gets its own thread.
 * The request handler sets `timeout = DEFAULT_TIMEOUT`, so a client that
   stalls mid-message can't hold a thread forever. A timeout or dropped
   connection while reading ends that handler quietly. A malformed request
   (bad JSON, too large) gets an `LMResponse(error="Bad request: ...")`.
-* `serve_forever()` runs in a daemon `Thread`.
+* `serve_forever(poll_interval=0.05)` runs in a daemon `Thread`. The default
+  interval of 0.5 s would make every `stop()` wait up to half a second.
+* An exception from the LM becomes that prompt's error, as
+  `"<ExceptionType>: <message>"`, so even an exception with an empty message
+  produces a useful error.
+* The request's `model` field is accepted but ignored: this MVP has a single
+  LM client.
 * `port=0` lets the OS pick a free port, so a new handler for each round never
   clashes with an earlier one.
 * **Batched requests:** one request carries all the prompts. The handler runs
