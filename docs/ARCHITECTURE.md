@@ -389,19 +389,39 @@ without replying.
 ```python
 custom_tools = {
     "triple": "def triple(x):\n    return x * 3",               # code string → exec'd
+    "double": "lambda x: 2 * x",                                # lambda string → eval'd, bound to "double"
     "CONST":  7,                                                # JSON value → variable
     "LOOKUP": {"tool": {"a": 1}, "description": "a dict"},      # value + description
 }
 ```
 
-* **Code strings** (starting with `def`, `class` or `lambda`, or containing a
-  newline) are run with `exec()` in the container's namespace.
-* **JSON-serializable values** are loaded as variables.
-* **Host callables are rejected with `ValueError`.** A Python function can't
-  cross into the container, so pass it as a code string instead. Failing
-  early makes the mistake obvious.
-* **Reserved names** can't be used: `llm_query`, `llm_query_batched`,
-  `SHOW_VARS` and `answer`.
+Each value is one of three kinds (`tool_kind()` in `environments/tools.py`):
+
+| Kind | Recognised by | In the container |
+|---|---|---|
+| **code** | a string starting with `def`, `class` or `async def`, or containing a newline | `exec(code, ns)`; it must define the tool's name |
+| **lambda** | a string starting with `lambda` | `ns[name] = eval(code)`. Running a lambda with `exec` would create the function and throw it away. |
+| **data** | anything else, including one-line strings | `ns[name] = json.loads(...)` |
+
+`validate_custom_tools()` checks everything **on the host, before a container
+starts**, and reports all problems in one `ValueError`:
+
+* **Names:** a valid Python identifier, not a keyword (`"class"` passes
+  `isidentifier()` but can't be assigned to), and not reserved (`llm_query`,
+  `llm_query_batched`, `SHOW_VARS`, `answer`).
+* **Host callables are rejected.** A Python function can't cross into the
+  container, so the message says to pass its source as a code string.
+* **Code is parsed with `ast`, never run.** It must be valid Python and must
+  define the tool's name at the top level (`def`, `class`, assignment or
+  `import ... as`). So `{"triple": "def tripel(x): ..."}` fails here, not
+  inside the container. A lambda must be a single lambda expression.
+* **Data must survive JSON unchanged.** It's sent as JSON, so tuples (which
+  would become lists), non-string dict keys (which would become strings) and
+  `NaN` are rejected rather than silently changed.
+* **Multi-line text counts as code.** Pass text as a list of lines; the error
+  message says so.
+
+Two more points:
 * **Tools are put into every generated script** by `_build_custom_tools_code()`,
   so user code that overwrites one doesn't break later runs.
 * **Descriptions go into the system prompt** through `format_tools_for_prompt()`.
@@ -648,7 +668,7 @@ dockerrepl/
   comms.py               # LMRequest/LMResponse, socket_send/recv/request, send_lm_request[_batched]
   lm_handler.py          # LMHandler (ThreadingTCPServer)
   environments/
-    tools.py             # RESERVED_TOOL_NAMES, validate_custom_tools, format_tools_for_prompt
+    tools.py             # RESERVED_TOOL_NAMES, tool_kind, validate_custom_tools, format_tools_for_prompt
     exec_script.py       # _build_exec_script, _build_custom_tools_code (template for _exec.py)
     proxy.py             # LMProxyHandler, make_handler_class, start_proxy_server
     container_manager.py # REPLResult, ContainerManager

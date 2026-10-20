@@ -27,7 +27,7 @@ The script:
 
 ## Depends on
 
-Step 2 (`DEFAULT_TIMEOUT`) and step 5 (`parse_tool_entry`, `is_code_string`).
+Step 2 (`DEFAULT_TIMEOUT`) and step 5 (`parse_tool_entry`, `tool_kind`).
 
 ## Files
 
@@ -112,7 +112,10 @@ generated script must:
 
 `_build_custom_tools_code` returns lines of Python for the generated script:
 
-* For a **code string** (`is_code_string`): `exec(<repr(code)>, ns)`.
+* For **code** (`tool_kind(value) == "code"`): `exec(<repr(code)>, ns)`.
+* For a **lambda** (`tool_kind(value) == "lambda"`):
+  `ns[<repr(name)>] = eval(<repr(code)>, ns)`. `exec` would create the
+  function and throw it away, so the name would never be defined.
 * For **data**: `ns[<repr(name)>] = json.loads(<repr(json.dumps(value))>)`.
 
 ## Tests — `tests/test_exec_script.py`
@@ -146,6 +149,7 @@ fast there.
 | `test_show_vars_when_empty` | a fresh workspace gives `"No variables created yet."` |
 | `test_tricky_code_is_safe` | code containing `'''`, `"""`, a backslash and `{}` runs and prints exactly as written |
 | `test_custom_code_tool_available` | the tool `{"triple": "def triple(x):\n    return x * 3"}` makes `print(triple(5))` give `"15\n"` |
+| `test_custom_lambda_tool_available` | the tool `{"double": "lambda x: 2 * x"}` makes `print(double(4))` give `"8\n"` |
 | `test_custom_data_tool_available` | `{"CONST": 7, "LOOKUP": {"tool": {"a": 1}, "description": "d"}}` gives `print(CONST, LOOKUP["a"])` output `"7 1\n"` |
 | `test_tools_reinjected_after_overwrite` | run 1: `CONST = 0`; run 2: `print(CONST)` gives `"7\n"` |
 | `test_helpers_reinjected_after_overwrite` | run 1: `llm_query = None`; run 2: `print(callable(llm_query))` gives `"True\n"` |
