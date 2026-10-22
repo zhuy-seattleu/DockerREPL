@@ -422,7 +422,7 @@ starts**, and reports all problems in one `ValueError`:
   message says so.
 
 Two more points:
-* **Tools are put into every generated script** by `_build_custom_tools_code()`,
+* **Tools are loaded into every generated script** (`_tool_specs()` lists them),
   so user code that overwrites one doesn't break later runs.
 * **Descriptions go into the system prompt** through `format_tools_for_prompt()`.
 
@@ -436,33 +436,54 @@ the same script run on the host in unit tests, against a local proxy and a
 temporary directory.
 
 ```python
-PROXY = "<proxy_url>"                                       # http://host.docker.internal:<port> in the container
-STATE = "<workspace>/state.dill
+_PROXY = "<proxy_url>"                                      # http://host.docker.internal:<port> in the container
+_STATE = "<workspace>/state.dill"
+_CODE = base64.b64decode("<code_b64>").decode()             # the code block, never pasted in as text
 def llm_query(prompt, model=None) -> str                    # POST /llm_query
 def llm_query_batched(prompts, model=None) -> list[str]     # POST /llm_query_batched
 def SHOW_VARS() -> str                                      # list REPL variables, no network
-# custom tools: code strings pasted in, JSON values loaded with json.loads
-code = base64.b64decode("<code_b64>").decode()
 ```
 
+* **The code runs in the script's own module namespace** (`globals()` of
+  `__main__`), not in a separate dict. dill saves a function defined in
+  `__main__` with a reference to `__main__`'s globals, so a function saved in
+  one exec sees the current variables and helpers in the next. With a
+  separate dict, dill copies that dict into each function: the function then
+  reads stale values, and can't be saved at all if any variable can't be
+  pickled. So every name the script itself uses starts with `_`, and names
+  starting with `_` are never saved or shown.
 * `llm_query` and `llm_query_batched` return `"Error: ..."` strings instead of
-  raising, so a failed LM call doesn't crash the user's code.
+  raising, so a failed LM call doesn't crash the user's code. They ignore
+  proxy settings from the environment (`trust_env = False`), so a corporate
+  `HTTP_PROXY` can't capture the call to `host.docker.internal`.
 * `SHOW_VARS()` returns `"Available variables: {name: type_name, ...}"` for
-  every variable whose name doesn't start with `_`, leaving out `answer`. If
-  there are none, it says so. The LM can use it to look inside the container
-  before writing more code, for example `print(SHOW_VARS())`. It runs entirely
-  inside the container and makes no LM call.
+  the variables the code created: names not starting with `_`, leaving out
+  the helpers, the custom tools and `answer`. If there are none, it says so.
+  The LM can use it to look inside the container before writing more code,
+  for example `print(SHOW_VARS())`. It runs entirely inside the container and
+  makes no LM call.
 * Steps for each exec:
-  1. Decode `code` from base64.
-  2. Load `state.dill`. If there is no `answer`, set
-     `answer = {"content": "", "ready": False}`.
-  3. Build the namespace from the helpers plus the custom tools.
-  4. `exec(code)`, with stdout and stderr captured to buffers.
-  5. Save every variable that dill can pickle and whose name doesn't start
-     with `_`. The save writes `state.dill.tmp` and then calls `os.replace`
-     to rename it over `state.dill`. If the process is killed mid-save, the
+  1. Load `state.dill` into the namespace. A missing file means a fresh
+     start; a corrupt one also starts fresh, with a warning in stderr.
+  2. Define the helpers, so they replace any saved copies. If `answer` is
+     missing or isn't a dict, set `answer = {"content": "", "ready": False}`.
+  3. With stdout and stderr redirected to `io.StringIO` buffers: load the
+     custom tools (an error in one is reported in stderr, and the code still
+     runs), then run the code. Tracebacks name the code `<repl>` and show its
+     lines. Any exception, including `SystemExit`, is reported in stderr and
+     the script carries on, so variables set before the error are kept.
+  4. Save every user variable that dill can pickle, plus `answer`. The save
+     writes `state.dill.tmp` and then calls `os.replace` to rename it over
+     `state.dill`. If the save fails or the process is killed mid-save, the
      old file is left whole.
-  6. Print one JSON line: `{stdout, stderr, locals, final_answer}`.
+  5. Print one JSON line, `{stdout, stderr, locals, final_answer}`, after the
+     redirect has ended and with a newline before it. stdout and stderr keep
+     their first and last 10,000 characters if they're longer than 20,000;
+     each `repr` in `locals` is cut at 500 characters.
+* **Not captured:** output that bypasses `sys.stdout` and `sys.stderr`, such
+  as `os.write(1, ...)` or a subprocess's output, goes to the script's real
+  stdout. It appears before the JSON line, so nothing breaks, but it isn't in
+  the `stdout` field.
 * **Saved LM responses** are just variables. For example, `r = llm_query(...)`
   is still there in the next exec, and in the next round if `persistent=True`.
 
@@ -669,7 +690,7 @@ dockerrepl/
   lm_handler.py          # LMHandler (ThreadingTCPServer)
   environments/
     tools.py             # RESERVED_TOOL_NAMES, tool_kind, validate_custom_tools, format_tools_for_prompt
-    exec_script.py       # _build_exec_script, _build_custom_tools_code (template for _exec.py)
+    exec_script.py       # _build_exec_script, _tool_specs (template for _exec.py)
     proxy.py             # LMProxyHandler, make_handler_class, start_proxy_server
     container_manager.py # REPLResult, ContainerManager
   client.py              # Client, build_system_prompt, format_result
