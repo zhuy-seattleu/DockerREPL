@@ -323,7 +323,7 @@ Each row was checked by making the mistake on purpose:
 
 | Mistake | What goes wrong | Caught by |
 |---|---|---|
-| **Running the code in a separate `ns` dict** | saved functions read stale values, or aren't saved at all | `test_function_sees_current_variables`, `test_function_kept_next_to_unpicklable_value` |
+| **Running the code in a separate `ns` dict** | a saved function keeps reading old values of the globals it uses, and is lost if it was defined in the same run as a value that can't be pickled. Functions that use only their arguments still work, which makes the bug easy to miss | `test_function_sees_current_variables`, `test_function_kept_next_to_unpicklable_value` |
 | **Pasting `code` straight into the template** | one `'''` in LM-written code breaks the script, or worse, injects code | `test_code_is_never_pasted_in`, `test_tricky_code_is_safe` |
 | **Printing the result JSON while stdout is still redirected** | it ends up inside the captured `stdout` | `test_prints_stdout` and others |
 | **No newline before the JSON** | `os.write(1, b"raw")` and the JSON share a line | `test_raw_write_without_newline` |

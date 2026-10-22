@@ -10,13 +10,23 @@ container from step 8 on, as a local subprocess in the tests). It:
 4. saves the variables again (atomically);
 5. prints one JSON line: {"stdout", "stderr", "locals", "final_answer"}.
 
-The code runs in the script's own module namespace (`globals()` of
-`__main__`), not in a separate dict. dill saves a function defined in
-`__main__` with a *reference* to `__main__`'s globals, so a function from an
-earlier run sees today's variables and helpers. With a separate dict, dill
-would copy that whole dict into every function, which goes stale and fails as
-soon as any variable can't be pickled. So every name the script itself needs
-starts with `_`; those names are never saved or shown.
+Why the code runs in `globals()`, not in a separate dict:
+
+* A function looks up its global names (variables, helpers, other
+  functions) in the dict it was defined in, `f.__globals__`.
+* Each code block runs in a new process, so dill must save `f` and, with it,
+  something for `f.__globals__`.
+* If that dict is `__main__`'s own, dill saves only a reference to it. When
+  the next run loads `f`, the reference points at that run's globals, so `f`
+  sees the current variables.
+* If it's a separate dict, dill saves a copy of the dict. `f` then keeps
+  reading the values from the run that saved it, even after a later run
+  changes them. Also, if the copy holds a value that can't be pickled (say a
+  generator made in the same run), `f` can't be saved at all.
+
+The script's own names share this namespace, so they all start with `_`.
+Names starting with `_` are never saved or shown, and they can't clash with
+the user's names (the script uses `_json`, so the user's `json` is safe).
 """
 
 import base64
