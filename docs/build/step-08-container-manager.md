@@ -59,7 +59,7 @@ class ContainerManager:
     lm_handler_address: tuple[str, int] | None
     container_id: str | None
     temp_dir: str
-    proxy_server: ThreadingHTTPServer | None
+    proxy_server: ThreadingProxyServer | None
     proxy_thread: threading.Thread | None
     proxy_port: int
     def setup(self) -> None: ...
@@ -138,7 +138,7 @@ rules:
 | `test_docker_run_command` | the `run` call contains `-d`, `--rm`, `-v <temp_dir>:/workspace`, `--add-host host.docker.internal:host-gateway`, the image, and `tail -f /dev/null` |
 | `test_installs_dependencies` | a `pip install -q dill requests` exec call follows `run` |
 | `test_setup_failure_cleans_up` | `docker run` returns exit code 1: raises `RuntimeError`, the proxy is shut down and `temp_dir` is gone |
-| `test_proxy_started` | `proxy_port > 0`, and the proxy answers `POST /llm_query` with `"No LM handler configured"` |
+| `test_proxy_started` | `proxy_port > 0`, and the proxy answers `POST /llm_query` (body `{"prompt": "hi"}`) with `"No LM handler configured"` |
 | `test_execute_writes_script_with_base64_code` | after `execute_code("print('x')")`, `<temp_dir>/_exec.py` exists and contains `base64.b64encode(b"print('x')").decode()` |
 | `test_execute_uses_timeout_wrapper` | the exec command is `[..., "timeout", "600", "python", "/workspace/_exec.py"]` |
 | `test_execute_parses_result` | a preset stdout of `"noise\n{json}\n"` gives the matching `REPLResult` fields |

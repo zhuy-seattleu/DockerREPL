@@ -284,7 +284,7 @@ class ContainerManager:
     lm_handler_address: tuple[str, int] | None    # read live by the proxy
     container_id: str | None
     temp_dir: str                                 # host side of /workspace
-    proxy_server: ThreadingHTTPServer | None
+    proxy_server: ThreadingProxyServer | None
     proxy_thread: threading.Thread | None
     proxy_port: int
     def setup(self) -> None: ...                  # called by __init__
@@ -301,8 +301,9 @@ class ContainerManager:
 3. Calls `start_proxy_server(self, "0.0.0.0", 0)` from `environments/proxy.py`.
    It creates a handler class bound to this manager,
    `type("Handler", (LMProxyHandler,), {"manager": self})`, and starts
-   `ThreadingHTTPServer(("0.0.0.0", 0), handler_cls)` with
-   `daemon_threads = True` in a daemon thread. `self.lm_handler_address` is usually `None` at this
+   `ThreadingProxyServer(("0.0.0.0", 0), handler_cls)` in a daemon thread.
+   `ThreadingProxyServer` is a `ThreadingHTTPServer` with
+   `daemon_threads = True` and `request_queue_size = 128`. `self.lm_handler_address` is usually `None` at this
    point; the Client sets it each round (§3.6).
 4. Runs `docker run -d --rm -v <tmp>:/workspace --add-host host.docker.internal:host-gateway <image> tail -f /dev/null`
    and saves the `container_id` it prints.
@@ -380,9 +381,19 @@ filled in by the per-manager subclass made in `setup()` step 3.
   request carrying all the prompts and returns `{"responses": [...]}`. A
   failed prompt comes back as `"Error: ..."` in its place in the list.
 
-It returns `{"error": "No LM handler configured"}` if no address is set, and
-`500 {"error"}` if the handler itself raises. It never drops a connection
-without replying.
+It never drops a connection without replying:
+* `{"error": "No LM handler configured"}` (status 200) if no address is set;
+* `{"error": "Request failed: ..."}` (status 200) if the LMHandler can't be
+  reached, for example because the round already ended;
+* `400 {"error": "Bad request: ..."}` for a missing `Content-Length`, a body
+  that isn't a JSON object, or a missing or wrongly typed `prompt`/`prompts`;
+* `404` for any other path, and `500 {"error": "Proxy handler error: ..."}`
+  if the handler itself raises.
+
+`llm_query` in the container reads the JSON body whatever the status, so each
+case reaches the user's code as an `"Error: ..."` string. Each request handler
+also has a socket timeout (`DEFAULT_TIMEOUT`), so a caller that stalls
+mid-request can't hold a thread forever.
 
 **`custom_tools`** format:
 
@@ -579,13 +590,13 @@ sequenceDiagram
 
     opt persistent: once per session, in Client.__enter__
         C->>M: ContainerManager(persistent, custom_tools), no handler address
-        M->>P: start ThreadingHTTPServer 0.0.0.0:0 with Handler bound to manager
+        M->>P: start ThreadingProxyServer 0.0.0.0:0 with Handler bound to manager
         M->>X: docker run … tail -f /dev/null, then pip install dill requests
     end
     U->>C: completion(prompt)
     opt not persistent: a fresh container for this round
         C->>M: ContainerManager(persistent, custom_tools), no handler address
-        M->>P: start ThreadingHTTPServer 0.0.0.0:0 with Handler bound to manager
+        M->>P: start ThreadingProxyServer 0.0.0.0:0 with Handler bound to manager
         M->>X: docker run … tail -f /dev/null, then pip install dill requests
     end
     C->>H: start() on port 0 → (127.0.0.1, port)
@@ -691,7 +702,7 @@ dockerrepl/
   environments/
     tools.py             # RESERVED_TOOL_NAMES, tool_kind, validate_custom_tools, format_tools_for_prompt
     exec_script.py       # _build_exec_script, _tool_specs (template for _exec.py)
-    proxy.py             # LMProxyHandler, make_handler_class, start_proxy_server
+    proxy.py             # LMProxyHandler, ThreadingProxyServer, make_handler_class, start_proxy_server
     container_manager.py # REPLResult, ContainerManager
   client.py              # Client, build_system_prompt, format_result
 examples/
