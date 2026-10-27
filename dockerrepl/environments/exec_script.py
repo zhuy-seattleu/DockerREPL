@@ -5,7 +5,8 @@ container from step 8 on, as a local subprocess in the tests). It:
 
 1. loads the saved variables from `<workspace>/state.dill`;
 2. defines `llm_query`, `llm_query_batched` and `SHOW_VARS`, then the custom
-   tools and `answer`;
+   tools and `answer` (a fresh one when `new_round` is set: the first code
+   block of a round must not see the previous round's answer);
 3. runs the code with stdout and stderr captured;
 4. saves the variables again (atomically);
 5. prints one JSON line: {"stdout", "stderr", "locals", "final_answer"}.
@@ -62,6 +63,7 @@ _STATE = _os.path.join({workspace!r}, "state.dill")
 _LLM_TIMEOUT = {llm_timeout!r}
 _MAX_OUTPUT = {max_output!r}
 _MAX_REPR = {max_repr!r}
+_NEW_ROUND = {new_round!r}
 _TOOLS = {tools!r}
 _TOOL_NAMES = {{_name for _kind, _name, _src in _TOOLS}}
 _HIDDEN = {{"llm_query", "llm_query_batched", "SHOW_VARS", "answer"}} | _TOOL_NAMES
@@ -124,7 +126,8 @@ def SHOW_VARS():
     return f"Available variables: {{_vars}}"
 
 
-if not isinstance(globals().get("answer"), dict):
+# A new round starts with a fresh answer; otherwise keep the one being built up.
+if _NEW_ROUND or not isinstance(globals().get("answer"), dict):
     answer = {{"content": "", "ready": False}}
 
 
@@ -217,11 +220,14 @@ def _build_exec_script(
     proxy_url: str,
     custom_tools: dict[str, Any] | None = None,
     workspace: str = "/workspace",
+    new_round: bool = False,
 ) -> str:
     """Return the source of a standalone script that runs `code` in the REPL.
 
     `code` is embedded base64-encoded, never pasted in, so nothing in it can
-    break the script. Every other value goes in through repr().
+    break the script. Every other value goes in through repr(). With
+    `new_round`, the script replaces any saved `answer` with a fresh one
+    before running the code.
     """
     return _TEMPLATE.format(
         proxy_url=proxy_url,
@@ -229,6 +235,7 @@ def _build_exec_script(
         llm_timeout=DEFAULT_TIMEOUT,
         max_output=MAX_OUTPUT_CHARS,
         max_repr=MAX_REPR_CHARS,
+        new_round=new_round,
         tools=_tool_specs(custom_tools),
         code_b64=base64.b64encode(code.encode("utf-8")).decode("ascii"),
     )

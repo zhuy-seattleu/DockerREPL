@@ -34,12 +34,12 @@ The script:
    `repr`s cut to a maximum length.
 7. **`_build_exec_script`** fills in the template. The code goes in
    base64-encoded; everything else goes in through `repr()`.
-8. **Write the unit tests.** `tests/test_exec_script.py` has 45 tests,
+8. **Write the unit tests.** `tests/test_exec_script.py` has 47 tests,
    including a fake proxy for `llm_query`.
 9. **Check that the tests catch real bugs** by making each mistake in the
    Pitfalls table on purpose.
 
-**Outcome:** `pytest -q` shows 45 more passing tests, and the CI table shows
+**Outcome:** `pytest -q` shows 47 more passing tests, and the CI table shows
 step 6 as ✅.
 
 ## What you'll learn
@@ -79,7 +79,8 @@ def _tool_specs(custom_tools: dict[str, Any] | None) -> list[tuple[str, str, str
 def _build_exec_script(code: str,
                        proxy_url: str,
                        custom_tools: dict[str, Any] | None = None,
-                       workspace: str = "/workspace") -> str: ...
+                       workspace: str = "/workspace",
+                       new_round: bool = False) -> str: ...
 ```
 
 * **`proxy_url`** is the full URL. In the container it is
@@ -87,6 +88,9 @@ def _build_exec_script(code: str,
   `http://127.0.0.1:<port>`, or any closed port.
 * **`workspace`** is where `state.dill` lives. In tests it is pytest's
   `tmp_path`.
+* **`new_round`** is `True` for the first code block of a round. The script
+  then replaces any saved `answer` with a fresh one, so an old `ready=True`
+  can't end the new round at once. The ContainerManager sets it in step 8.
 
 Taking the full URL and the workspace path as arguments is what lets the same
 script run on your machine in tests and inside the container in step 8.
@@ -143,10 +147,11 @@ There are two levels:
 skips it, for example `os.write(1, b"...")`, `subprocess.run(["ls"])` or a C
 extension that prints. That output goes to the real stdout, **before** the
 JSON line. Nothing breaks, because the host reads only the last line, but it
-isn't in the `stdout` field. The newline written before the JSON matters
-here: without it, `os.write(1, b"raw")` would put `raw{"stdout": ...` on one
-line, and the host couldn't parse it. Capturing at the file-descriptor level
-(`os.dup2` onto temp files) would close the gap, but this MVP doesn't need it.
+isn't in the script's `stdout` field. The ContainerManager in step 8 puts it
+back: everything before the JSON line goes in front of the `stdout` field it
+returns. The newline written before the JSON matters here: without it,
+`os.write(1, b"raw")` would put `raw{"stdout": ...` on one line, and the host
+couldn't parse it.
 
 ## Implementation guide
 
@@ -184,8 +189,9 @@ literal `{` and `}` in it. In order, the generated script must:
    - `SHOW_VARS() -> str` returns `"Available variables: {name: type_name, ...}"`
      for the user's variables: names not starting with `_` and not in
      `_HIDDEN`. If there are none it returns `"No variables created yet."`.
-5. **Set `answer = {"content": "", "ready": False}`**, **only if** `answer`
-   is missing or isn't a dict.
+5. **Set `answer = {"content": "", "ready": False}`** only if `new_round` is
+   set, or `answer` is missing or isn't a dict. Otherwise keep the saved one,
+   so the LM can build an answer over several blocks.
 6. **Run, inside `redirect_stdout(_out)` and `redirect_stderr(_err)`:**
    - Load each tool from `_TOOLS`: code with `exec(source, globals())`, a
      lambda with `globals()[name] = eval(source, globals())`, data with
@@ -227,8 +233,8 @@ A helper in the test file builds the script, runs it with the test's
 `tmp_path` as the workspace, and returns the parsed last line:
 
 ```python
-def run_script(tmp_path, code, proxy_url=CLOSED_PROXY, custom_tools=None) -> dict:
-    script = _build_exec_script(code, proxy_url, custom_tools, workspace=str(tmp_path))
+def run_script(tmp_path, code, proxy_url=CLOSED_PROXY, custom_tools=None, new_round=False) -> dict:
+    script = _build_exec_script(code, proxy_url, custom_tools, workspace=str(tmp_path), new_round=new_round)
     path = tmp_path / "_exec.py"
     path.write_text(script, encoding="utf-8")
     proc = subprocess.run([sys.executable, str(path)], capture_output=True,
@@ -278,6 +284,8 @@ the real proxy of step 7.
 | `test_final_answer` | `answer["content"] = "done"; answer["ready"] = True` gives `final_answer == "done"` |
 | `test_no_final_answer_by_default` | `x = 1` gives `final_answer is None` |
 | `test_answer_survives_between_runs` | run 1 sets `answer["content"] = "partial"` without `ready`; run 2 prints `"partial"` |
+| `test_new_round_resets_answer` | after `ready = True` is saved, a run with `new_round=True` sees a fresh `answer`; other variables are kept |
+| `test_new_round_only_resets_once` | a later run without `new_round` keeps the answer the first run started |
 | `test_answer_replaced_when_not_a_dict` | `answer = 5` gives no final answer, and the next run has a fresh `answer` dict |
 | **Embedding** | |
 | `test_tricky_code_is_safe` | code containing `'''`, `"""`, a backslash and `{}` runs and prints exactly as written |
@@ -309,7 +317,7 @@ Each test starts one or more Python processes, so the file takes about
 
 ## Done when
 
-- [ ] All 45 tests pass, and steps 0–5 still pass.
+- [ ] All 47 tests pass, and steps 0–5 still pass.
 - [ ] The printed JSON line is always the **last** line of stdout, even when
       user code prints a lot or writes to the real stdout.
 - [ ] `_build_exec_script` never pastes `code` into the template unencoded.

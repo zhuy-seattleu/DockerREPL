@@ -16,10 +16,14 @@ CLOSED_PROXY = "http://127.0.0.1:9"  # port 9 ("discard") is almost always close
 
 
 def run_script(
-    tmp_path: Path, code: str, proxy_url: str = CLOSED_PROXY, custom_tools: dict | None = None
+    tmp_path: Path,
+    code: str,
+    proxy_url: str = CLOSED_PROXY,
+    custom_tools: dict | None = None,
+    new_round: bool = False,
 ) -> dict[str, Any]:
     """Build the script for `code`, run it with `tmp_path` as the workspace, return its JSON line."""
-    script = _build_exec_script(code, proxy_url, custom_tools, workspace=str(tmp_path))
+    script = _build_exec_script(code, proxy_url, custom_tools, workspace=str(tmp_path), new_round=new_round)
     path = tmp_path / "_exec.py"
     path.write_text(script, encoding="utf-8")
     proc = subprocess.run(
@@ -247,6 +251,19 @@ def test_no_final_answer_by_default(tmp_path: Path) -> None:
 def test_answer_survives_between_runs(tmp_path: Path) -> None:
     run_script(tmp_path, 'answer["content"] = "partial"')
     assert run_script(tmp_path, 'print(answer["content"])')["stdout"] == "partial\n"
+
+
+def test_new_round_resets_answer(tmp_path: Path) -> None:
+    run_script(tmp_path, 'answer["content"] = "old"\nanswer["ready"] = True\nx = 1')
+    result = run_script(tmp_path, 'print(answer, x)', new_round=True)
+    assert result["stdout"] == "{'content': '', 'ready': False} 1\n"  # other variables are kept
+    assert result["final_answer"] is None
+
+
+def test_new_round_only_resets_once(tmp_path: Path) -> None:
+    # Only the first block of a round passes new_round; later blocks build on its answer.
+    run_script(tmp_path, 'answer["content"] = "part 1"', new_round=True)
+    assert run_script(tmp_path, 'print(answer["content"])')["stdout"] == "part 1\n"
 
 
 def test_answer_replaced_when_not_a_dict(tmp_path: Path) -> None:
