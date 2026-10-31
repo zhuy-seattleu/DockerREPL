@@ -307,20 +307,32 @@ class ContainerManager:
    point; the Client sets it each round (§3.6).
 4. Runs `docker run -d --rm -v <tmp>:/workspace --add-host host.docker.internal:host-gateway <image> tail -f /dev/null`
    and saves the `container_id` it prints.
-5. Runs `docker exec <id> pip install -q dill requests` (the default install),
-   then checks that `import requests` works.
+5. Checks `docker exec <id> python -c "import dill, requests"`. Only if that
+   fails does it run `docker exec <id> pip install -q dill requests`, then
+   check again. An image that already has both starts in about a second and
+   needs no network.
+
+The workspace folder is made under `.dockerrepl_workspace/` in the current
+directory, not in the system temp folder, because Docker Desktop (macOS,
+Windows) can only mount folders it shares. If `setup()` fails part-way, the
+constructor calls `cleanup()` before re-raising, so nothing is left behind.
 
 **`execute_code(code: str)`** takes the code block exactly as the LM wrote
 it, as found by `find_code_blocks`. It:
-1. Builds a complete script with `_build_exec_script(code, f"http://host.docker.internal:{proxy_port}", custom_tools)`
+1. Builds a complete script with `_build_exec_script(code, f"http://host.docker.internal:{proxy_port}", custom_tools, new_round=...)`
    (§3.5). The code is embedded **base64-encoded**, so quotes, backslashes and
    triple quotes in LM-written code can't break the script.
 2. Writes that script to `<tmp>/_exec.py`, which the container sees as
    `/workspace/_exec.py`.
-3. Runs `docker exec <id> timeout <exec_timeout> python /workspace/_exec.py`,
-   with `subprocess.run(..., timeout=exec_timeout + 10)` as a backstop in case
-   the `docker` command itself hangs.
-4. Parses the last line of stdout as JSON and returns:
+3. Runs `docker exec <id> timeout -k 5 <exec_timeout> python /workspace/_exec.py`,
+   with `subprocess.run(..., timeout=exec_timeout + 15)` as a backstop in case
+   the `docker` command itself hangs. `timeout` sends SIGTERM at the limit
+   and, with `-k 5`, SIGKILL five seconds later if the code ignores SIGTERM.
+4. Parses the last line of stdout as JSON. Any lines before it were written
+   straight to the real stdout, bypassing the script's capture (for example
+   by a subprocess), so they're put in front of the `stdout` field. The
+   process's own stderr (for example a `docker` error) is added to `stderr`.
+   It returns:
 
 ```python
 @dataclass
@@ -337,7 +349,7 @@ needed because the LM writes the code, and that code can loop forever
 (`while True:`) or block. Without a limit, `docker exec` would never return.
 The Client's thread would hang and the round could never end. When the limit
 is hit, `timeout` kills the Python process inside the container (exit code
-124). `execute_code` then returns a `REPLResult` with
+124, or 137 after SIGKILL). `execute_code` then returns a `REPLResult` with
 `stderr = "Execution timed out after <n> s"` and no final answer, and the LM
 sees that error in its next turn. Because the process died before saving,
 `state.dill` still holds the state from before that code block (§3.5 step 5).
@@ -355,10 +367,27 @@ it is re-applied before every code block. That also makes it survive a
 non-persistent round or a restarted container. A one-time hook would add a
 second way to do the same thing, plus rules for when it reruns.
 
-**`update_handler_address(address)`** sets `self.lm_handler_address = address`.
-It also runs `answer = {"content": "", "ready": False}` in the container, so
-an old `ready=True` from the previous round doesn't end the new round at
-once. The container never sees the change of address.
+**`update_handler_address(address)`** sets `self.lm_handler_address = address`
+and starts a new round. The container never sees the change of address.
+
+**A new round starts with a fresh `answer`.** Otherwise an old `ready=True`
+from the previous round would end the new round at once, returning the old
+answer. There's no separate reset command, which could fail on its own.
+Instead `update_handler_address()` sets a flag, and the next
+`execute_code()` passes `new_round=True` to `_build_exec_script()`. That
+script replaces `answer` with `{"content": "", "ready": False}` before the
+code runs. The flag is cleared only after a block runs to the end and saves
+its state. If the first block of a round times out, its reset was never
+saved, so the next block resets again.
+
+**`cleanup()`** is idempotent and carries on past failures. It empties
+`/workspace` from inside the container
+(`find /workspace -mindepth 1 -delete`), because files root created there
+can't always be deleted from the host. Then it runs `docker rm -f <id>`,
+stops the proxy, and deletes the workspace folder.
+
+**Calls must not overlap.** Every `execute_code()` writes the same
+`/workspace/_exec.py`. The Client runs code blocks one at a time.
 
 **`LMProxyHandler(BaseHTTPRequestHandler)`** has two routes, and every reply is
 JSON. It declares `manager: ContainerManager` as a class attribute, which is
@@ -476,8 +505,9 @@ def SHOW_VARS() -> str                                      # list REPL variable
 * Steps for each exec:
   1. Load `state.dill` into the namespace. A missing file means a fresh
      start; a corrupt one also starts fresh, with a warning in stderr.
-  2. Define the helpers, so they replace any saved copies. If `answer` is
-     missing or isn't a dict, set `answer = {"content": "", "ready": False}`.
+  2. Define the helpers, so they replace any saved copies. If this is the
+     first block of a round (`new_round=True`), or `answer` is missing or
+     isn't a dict, set `answer = {"content": "", "ready": False}`.
   3. With stdout and stderr redirected to `io.StringIO` buffers: load the
      custom tools (an error in one is reported in stderr, and the code still
      runs), then run the code. Tracebacks name the code `<repl>` and show its
@@ -491,10 +521,11 @@ def SHOW_VARS() -> str                                      # list REPL variable
      redirect has ended and with a newline before it. stdout and stderr keep
      their first and last 10,000 characters if they're longer than 20,000;
      each `repr` in `locals` is cut at 500 characters.
-* **Not captured:** output that bypasses `sys.stdout` and `sys.stderr`, such
-  as `os.write(1, ...)` or a subprocess's output, goes to the script's real
-  stdout. It appears before the JSON line, so nothing breaks, but it isn't in
-  the `stdout` field.
+* **Not captured by the script:** output that bypasses `sys.stdout` and
+  `sys.stderr`, such as `os.write(1, ...)` or a subprocess's output, goes to
+  the script's real stdout, before the JSON line. The ContainerManager puts
+  stdout written this way in front of the `stdout` field (§3.4). Such stderr
+  output is added to `stderr` the same way.
 * **Saved LM responses** are just variables. For example, `r = llm_query(...)`
   is still there in the next exec, and in the next round if `persistent=True`.
 
@@ -591,24 +622,24 @@ sequenceDiagram
     opt persistent: once per session, in Client.__enter__
         C->>M: ContainerManager(persistent, custom_tools), no handler address
         M->>P: start ThreadingProxyServer 0.0.0.0:0 with Handler bound to manager
-        M->>X: docker run … tail -f /dev/null, then pip install dill requests
+        M->>X: docker run … tail -f /dev/null, then pip install dill requests if missing
     end
     U->>C: completion(prompt)
     opt not persistent: a fresh container for this round
         C->>M: ContainerManager(persistent, custom_tools), no handler address
         M->>P: start ThreadingProxyServer 0.0.0.0:0 with Handler bound to manager
-        M->>X: docker run … tail -f /dev/null, then pip install dill requests
+        M->>X: docker run … tail -f /dev/null, then pip install dill requests if missing
     end
     C->>H: start() on port 0 → (127.0.0.1, port)
     C->>M: update_handler_address((host, port))
-    M->>M: self.lm_handler_address = (host, port), read live by the proxy
+    M->>M: self.lm_handler_address = (host, port), read live by the proxy; next block resets answer
     loop iteration ≤ max_iterations
         C->>H: completion(messages) (direct call)
         H-->>C: reply text with repl code blocks
         loop each code block
             C->>M: execute_code(code)
-            M->>M: _build_exec_script(code) → write /workspace/_exec.py
-            M->>X: docker exec <id> python /workspace/_exec.py
+            M->>M: _build_exec_script(code, new_round) → write /workspace/_exec.py
+            M->>X: docker exec <id> timeout … python /workspace/_exec.py
             opt llm_query / llm_query_batched
                 X->>P: HTTP POST /llm_query[_batched]
                 P->>H: TCP [len][JSON LMRequest]
@@ -638,7 +669,7 @@ the session lasts beyond the round.
 | Container + proxy | made at the start of the round, removed at the end | made once in `Client.__enter__`, reused until `Client.close()` |
 | LMHandler | new each round, started after the container; `update_handler_address()` points the proxy at it | same |
 | Variables / saved LM responses | gone after the round | carried into later rounds |
-| `answer` | starts fresh | reset by `update_handler_address()` at the start of each round |
+| `answer` | starts fresh | reset by the first code block after `update_handler_address()` |
 
 ## 6. Threading and concurrency
 
@@ -687,6 +718,12 @@ the session lasts beyond the round.
   to it.
 * **No container ports are published.** All code execution goes through
   `docker exec`.
+* **Known limitation: the proxy is reachable from the local network.**
+  Binding to `0.0.0.0` means any machine that can reach this one, for example
+  on the same Wi-Fi, can send requests to the proxy's port, and so to the LM.
+  That costs nothing with MockLM, but with a paid LM it spends your budget.
+  A fix would be a random token for each container that `llm_query` sends in
+  a header and the proxy checks. This MVP leaves it out.
 
 ## 8. Layout
 
