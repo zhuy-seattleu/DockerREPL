@@ -577,25 +577,41 @@ def completion(self, prompt: str) -> str:
         # 2. A new LMHandler for this round; point the proxy at it.
         with LMHandler(self.lm) as lm_handler:
             env.update_handler_address(lm_handler.address)
-            # 3. Iterations.
+            # 3. Iterations: one LM reply each.
             messages = build_system_prompt(self.custom_tools) + [user(prompt)]
             for _ in range(self.max_iterations):
                 reply = lm_handler.completion(messages)
                 messages.append(assistant(reply))
-                for code in find_code_blocks(reply):        # see dockerrepl/parsing.py
-                    result = env.execute_code(code)
-                    if result.final_answer is not None:
-                        return result.final_answer
-                    messages.append(user(format_result(code, result)))
-            return lm_handler.completion(messages + [ask_for_final_answer()])
+                answer, feedback = run_blocks(env, reply)  # stops at the first final answer
+                if answer is not None:
+                    return answer
+                messages.append(user(feedback or NO_CODE_REMINDER))
+            # 4. Out of iterations: ask once more, in a block or in plain text.
+            reply = lm_handler.completion(messages + [FINAL_ANSWER_REQUEST])
+            answer, _ = run_blocks(env, reply)
+            return answer if answer is not None else reply
     finally:
         if not self.persistent:
             env.cleanup()
 ```
 
+`run_blocks` runs the reply's ```` ```repl ```` blocks (`find_code_blocks`,
+`dockerrepl/parsing.py`) in order with `env.execute_code`. It returns at the
+first block that sets a final answer, so later blocks don't run. Otherwise it
+returns the `format_result()` text of every block, joined into **one** `user`
+message, so roles keep alternating as LM APIs expect. A reply with no blocks
+gets a reminder instead.
+
 * Both modes use the same order: container, then handler, then iterations.
   `persistent` only decides whether the container is reused and when it is
-  removed.
+  removed. Because the container comes first, a container that fails to
+  start leaves no handler running.
+* **Persistent rounds take turns.** A persistent container runs one code
+  block at a time, so `completion()` holds a per-Client lock in persistent
+  mode. Non-persistent rounds each have their own container and can run in
+  parallel.
+* **`format_result()`** shows the code, its stdout and its stderr, each cut
+  to 5,000 characters, so one noisy print can't fill the LM's context.
 * **Clean shutdown order.** The LMHandler stops when its `with` block ends.
   Only after that does `finally` remove a non-persistent container. A
   persistent container and its proxy stay up until `close()`.
